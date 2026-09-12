@@ -58,9 +58,14 @@ fetch() {
 
 verify_sum() {
 	_sums="$DL_DIR/SHA256SUMS.$DOVE_VERSION"
-	[ -f "$_sums" ] || return 0
+	[ -f "$_sums" ] || { log "无 SHA256SUMS，跳过 sha256 校验"; return 0; }
 	_want="$(awk -v n="$ASSET" '$2 == n { print $1; exit }' "$_sums")"
-	[ -n "$_want" ] || return 0
+	if [ -z "$_want" ]; then
+		# 常见原因：release 资产被 --clobber 重发后，GitHub CDN 仍在吐旧副本。
+		# 静默 return 0 会把"校验被跳过"伪装成"校验通过"，所以这里必须吵。
+		echo "download-dove: ⚠️ SHA256SUMS 无 $ASSET 条目（当前副本 $(wc -c <"$_sums" | tr -d ' ') 字节），未做 sha256 校验" >&2
+		return 0
+	fi
 	_got="$(sha256sum "$1" | cut -d' ' -f1)"
 	if [ "$_got" != "$_want" ]; then
 		echo "download-dove: sha256 不匹配 $ASSET" >&2
@@ -74,9 +79,11 @@ verify_sum() {
 log "core 二进制 ${DOVE_VERSION} 架构 ${ARCH_SUFFIX}"
 
 # SHA256SUMS 每次都尝试刷新（上游同 tag 重发资产时，旧缓存会让新资产永远校验失败）
+# 实测：同一 tag 用 --clobber 重发 SHA256SUMS 后，不带参数的 URL 仍会命中 GitHub CDN
+# 的旧副本（返回旧文件、里面没有新资产条目）→ 必须加 cache-buster。
 SUMS_FILE="$DL_DIR/SHA256SUMS.$DOVE_VERSION"
 rm -f "$SUMS_FILE.tmp"
-if curl -fsSL --retry 2 --connect-timeout 10 -o "$SUMS_FILE.tmp" "$BASE_URL/SHA256SUMS" 2>/dev/null; then
+if curl -fsSL --retry 2 --connect-timeout 10 -o "$SUMS_FILE.tmp" "$BASE_URL/SHA256SUMS?cb=$(date +%s)-$$" 2>/dev/null; then
 	mv "$SUMS_FILE.tmp" "$SUMS_FILE"
 else
 	rm -f "$SUMS_FILE.tmp"

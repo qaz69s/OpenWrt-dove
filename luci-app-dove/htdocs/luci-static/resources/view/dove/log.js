@@ -100,7 +100,12 @@ function parseLogfmt(raw) {
 }
 
 function extractHms(s) {
-	var m = String(s || '').match(/\b(\d{2}:\d{2}:\d{2})\b/);
+	/*
+	 * 时间戳已对齐 honk：2026-09-13T06:40:12.123456+08:00。
+	 * ISO 的 T 与数字之间没有词边界，原来带 \b 的写法会抓不到，
+	 * 去掉 \b（旧的空格格式 "2026-09-13 06:40:12" 同样匹配）。
+	 */
+	var m = String(s || '').match(/(\d{2}:\d{2}:\d{2})/);
 	return m ? m[1] : '';
 }
 

@@ -109,7 +109,10 @@ return view.extend({
 				]),
 				pre,
 				E('div', { style: 'font-size:12px;color:var(--secondary-color-high, #888);margin-top:6px;' }, [
-					_('日志轮转由 init 在启动时执行（UCI: logfile_maxsize / logfile_maxbackups）；core 没有内建轮转。')
+					_('日志轮转由 init 在启动时执行（UCI: logfile_maxsize / logfile_maxbackups）；core 没有内建轮转。'),
+					E('br'),
+					_('注意：core 版没有装日志渲染器，这个文件里只有 init/validate 的输出和 service ready/stopping 标记；' +
+					  '运行时明细请切到「系统日志 (logread)」——daed 那套阶段耗时/日志流属于产品层，core 里不存在。')
 				])
 			])
 		]);

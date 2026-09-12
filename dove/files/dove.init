@@ -1,0 +1,245 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Dove —— DaeNext (daed) Rust 原生 eBPF 透明代理，procd 服务脚本
+#
+# 与 joey 的区别：joey 跑的是上游 dae（Go 版，直接吃 /etc/joey/config.dae 文本），
+# Dove 跑的是 DaeNext 的 daed —— daed 的运行时配置来自它自己的 SQLite 状态库，
+# 不读文本配置。所以 Dove 只负责把进程管起来；配置通过 REST API 由 luci-app-dove
+# （dae 配置文本导入/导出 + runtime reload）来改。
+#
+# 自启由 /etc/rc.d/S95dove 软链决定（LuCI「开机自启」开关 = enable/disable）。
+# 这里刻意不检查 UCI enabled 选项：那会让 LuCI 的「启动」按钮静默失效
+# （setInitAction('start') 直接调用 start_service，不会先改 UCI 标志）。
+
+START=95
+STOP=10
+USE_PROCD=1
+
+NAME=dove
+PROG="${DOVE_PROG:-/usr/bin/dove}"
+DEFAULT_CONFIG_DIR=/etc/dove
+DEFAULT_LISTEN=0.0.0.0:2023
+DEFAULT_WEB_ROOT=/usr/share/dove/web
+DEFAULT_LOG_DIR=/tmp/log/dove
+DEFAULT_GEODATA_DIR=/usr/share/dove
+# Dove 用独立控制 socket：daed 的编译内置默认是 /run/daed/control.sock，
+# 与 deer / 原生 daed 包共用同一个 socket 会导致两者不能同时运行。
+DEFAULT_CONTROL_SOCKET=/run/dove/control.sock
+# GEOIP / GEOSITE 在 load_dove_config 里按 geodata_dir 计算
+GEOIP=
+GEOSITE=
+RESOLV_DOVE=/tmp/resolv.conf.dove
+
+EXTRA_COMMANDS="hot_reload wait_ready"
+EXTRA_HELP="        hot_reload   Reload daed runtime config (dove reload + wait-ready)
+        wait_ready   Wait for daed control-plane readiness"
+
+load_dove_config() {
+	config_load "$NAME"
+
+	config_get config_dir main config_dir "$DEFAULT_CONFIG_DIR"
+	config_get state main state "$config_dir/daed.db"
+	config_get listen main listen "$DEFAULT_LISTEN"
+	config_get web_root main web_root "$DEFAULT_WEB_ROOT"
+	config_get control_socket main control_socket "$DEFAULT_CONTROL_SOCKET"
+	# geodata（geoip.dat / geosite.dat）目录：默认取 web_root 的父目录，与 daed 的
+	# geodata_dir_for_web_root() 约定一致（面板的 geodata 状态页读的就是这里）。
+	# ⚠️ 但 daed 在构建/预检运行时只用 DAE_LOCATION_ASSET、调用方传入目录、
+	# 以及 /etc/daed、/usr/local/share/daed、/usr/share/daed、~/.local/share/daed
+	# 这些固定目录去找 .dat（GeodataResolver::new 的顺序），web_root 不在其中 ——
+	# 所以必须在下面 export / procd 传 DAE_LOCATION_ASSET，否则会报
+	# `geodata asset geoip.dat not found in [...]`。
+	config_get geodata_dir main geodata_dir ""
+	[ -n "$geodata_dir" ] || geodata_dir="$(dirname "$web_root")"
+	GEOIP="$geodata_dir/geoip.dat"
+	GEOSITE="$geodata_dir/geosite.dat"
+	export DAE_LOCATION_ASSET="$geodata_dir"
+	config_get log_dir main log_dir "$DEFAULT_LOG_DIR"
+	config_get_bool api_only main api_only 0
+
+	config_get_bool validate_start main validate_start 1
+	config_get_bool validate_reload main validate_reload 1
+	config_get_bool hijack_resolv main hijack_resolv 0
+	config_get reload_ready_timeout main reload_ready_timeout 2s
+	config_get reload_recovery_timeout main reload_recovery_timeout 30s
+	config_get term_timeout main term_timeout 10
+
+	config_get_bool respawn main respawn 1
+	config_get respawn_threshold main respawn_threshold 3600
+	config_get respawn_timeout main respawn_timeout 5
+	config_get respawn_retry main respawn_retry 5
+
+	config_get nofile main nofile 1048576
+	config_get nproc main nproc 512
+
+	config_get http_profile main http_profile "low-memory"
+	config_get resident_runtime_profile main resident_runtime_profile ""
+	config_get http_workers main http_workers ""
+	config_get http_queue main http_queue ""
+	config_get worker_stack_bytes main worker_stack_bytes ""
+}
+
+validate_dove_config() {
+	"$PROG" validate -c "$config_dir" --state "$state"
+}
+
+validate_dove_runtime_config() {
+	"$PROG" validate -c "$config_dir" --state "$state" --runtime
+}
+
+wait_ready() {
+	local timeout="${1:-$reload_ready_timeout}"
+	"$PROG" wait-ready --control "$control_socket" --timeout "$timeout"
+}
+
+# geoip.dat / geosite.dat 放在 geodata_dir（默认 web_root 的父目录），
+# 并通过 DAE_LOCATION_ASSET 告知 daed（详见 load_dove_config 里的说明）
+ensure_geodata() {
+	[ -f "$GEOIP" ]   || ln -sf ../v2ray/geoip.dat   "$GEOIP"   2>/dev/null
+	[ -f "$GEOSITE" ] || ln -sf ../v2ray/geosite.dat "$GEOSITE" 2>/dev/null
+
+	# 兜底：daed 的产品默认目录之一（GeodataResolver 的固定搜索路径，
+	# 也是 daed service-metadata 自己声明 geoip/geosite 的路径）。即使
+	# DAE_LOCATION_ASSET 因为某种原因没传到运行时，预检/运行时也能在这里找到。
+	# 已存在同名文件则不覆盖（留给用户放自己的 geodata 用）。
+	[ -d /usr/share/daed ] || mkdir -p /usr/share/daed 2>/dev/null
+	[ -e /usr/share/daed/geoip.dat ]   || ln -sf ../v2ray/geoip.dat   /usr/share/daed/geoip.dat   2>/dev/null
+	[ -e /usr/share/daed/geosite.dat ] || ln -sf ../v2ray/geosite.dat /usr/share/daed/geosite.dat 2>/dev/null
+}
+
+# 可选：把 /tmp/resolv.conf 指向 daed 的 DNS（默认关闭）
+# 打开后路由器自身 DNS 走 daed，配置不当会导致全机解析失败 —— 谨慎开启
+hijack_resolv_conf() {
+	[ "$hijack_resolv" = "1" ] || return 0
+	grep -q ' /tmp/resolv\.conf ' /proc/mounts && return 0
+
+	grep -E '^(search|domain) ' /tmp/resolv.conf >"$RESOLV_DOVE" 2>/dev/null
+
+	local dns_list LOGICAL_WAN
+	. /lib/functions/network.sh
+	network_find_wan LOGICAL_WAN 2>/dev/null
+	if [ -n "$LOGICAL_WAN" ]; then
+		dns_list=$(ubus call "network.interface.$LOGICAL_WAN" status 2>/dev/null | \
+			jsonfilter -e '@["dns-server"][*]' 2>/dev/null)
+	fi
+	if [ -z "$dns_list" ] && [ -f "/tmp/resolv.conf.d/resolv.conf.auto" ]; then
+		dns_list=$(awk '/^nameserver/{print $2}' "/tmp/resolv.conf.d/resolv.conf.auto")
+	fi
+	[ -z "$dns_list" ] && dns_list="119.29.29.29 223.5.5.5"
+
+	for dns in $dns_list; do
+		echo "nameserver $dns" >>"$RESOLV_DOVE"
+	done
+
+	mount --bind "$RESOLV_DOVE" /tmp/resolv.conf
+	mount -o remount,ro,bind /tmp/resolv.conf
+}
+
+restore_resolv_conf() {
+	grep -q ' /tmp/resolv\.conf ' /proc/mounts || return 0
+	mount -o remount,rw,bind /tmp/resolv.conf 2>/dev/null
+	umount /tmp/resolv.conf 2>/dev/null
+	rm -f "$RESOLV_DOVE"
+}
+
+start_service() {
+	load_dove_config
+
+	[ -x "$PROG" ] || {
+		echo "$PROG not found or not executable (install package dove first)"
+		return 1
+	}
+
+	mkdir -p "$config_dir" "$log_dir" "$web_root" "$(dirname "$control_socket")"
+	chmod 0700 "$config_dir" "$(dirname "$control_socket")" 2>/dev/null || true
+
+	# 崩溃/断电后残留的控制 socket 会让 daed 拒绝启动
+	# （"control socket is already accepting connections"）。仅在确认没有
+	# dove 实例在跑时清理，避免误删正在运行实例的 socket。
+	if [ -S "$control_socket" ] && ! pidof dove >/dev/null 2>&1; then
+		rm -f "$control_socket"
+	fi
+
+	if [ "$validate_start" = "1" ]; then
+		validate_dove_config || return 1
+	fi
+
+	hijack_resolv_conf || return 1
+	ensure_geodata
+
+	procd_open_instance
+	procd_set_param command "$PROG" run
+	# ⚠️ 始终显式传参：上游 daed.init 是「与默认值相同就省略」，但 daed 的编译
+	# 内置默认是 /etc/daed、/usr/share/daed/web、/run/daed/control.sock，
+	# 与 Dove 的路径都不同 —— 一旦省略，daed 会去读别的目录，与 validate
+	# 校验的目录、LuCI 页读的路径全都不一致。
+	procd_append_param command -c "$config_dir"
+	procd_append_param command --state "$state"
+	procd_append_param command --listen "$listen"
+	procd_append_param command --web-root "$web_root"
+	procd_append_param command --control "$control_socket"
+
+	if [ "$api_only" = "1" ]; then
+		procd_append_param command --api-only
+	fi
+
+	procd_set_param env PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+	procd_append_param env DAED_PRODUCT_LOG_DIR="$log_dir"
+	procd_append_param env NO_COLOR=1
+	# 运行时/预检的 geodata 查找靠这个变量（见 load_dove_config 里的说明）
+	procd_append_param env DAE_LOCATION_ASSET="$geodata_dir"
+	[ -n "$http_profile" ] && procd_append_param env HTTP_PROFILE="$http_profile"
+	[ -n "$resident_runtime_profile" ] && procd_append_param env RESIDENT_RUNTIME_PROFILE="$resident_runtime_profile"
+	[ -n "$http_workers" ] && procd_append_param env HTTP_WORKERS="$http_workers"
+	[ -n "$http_queue" ] && procd_append_param env HTTP_QUEUE="$http_queue"
+	[ -n "$worker_stack_bytes" ] && procd_append_param env HTTP_WORKER_STACK_BYTES="$worker_stack_bytes"
+
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param term_timeout "$term_timeout"
+	procd_set_param limits nofile="$nofile $nofile" nproc="$nproc $nproc"
+
+	if [ "$respawn" = "1" ]; then
+		procd_set_param respawn "$respawn_threshold" "$respawn_timeout" "$respawn_retry"
+	fi
+
+	procd_close_instance
+}
+
+stop_service() {
+	restore_resolv_conf
+}
+
+reload_service() {
+	load_dove_config
+
+	[ -x "$PROG" ] || {
+		echo "$PROG not found or not executable"
+		return 1
+	}
+
+	if [ "$validate_reload" = "1" ]; then
+		validate_dove_runtime_config || return 1
+	fi
+
+	hijack_resolv_conf || return 1
+	"$PROG" reload --control "$control_socket" && return 0
+	local reload_status=$?
+
+	if "$PROG" wait-ready --control "$control_socket" --timeout "$reload_ready_timeout" >/dev/null 2>&1; then
+		return "$reload_status"
+	fi
+
+	echo "dove reload left the runtime unavailable; restarting the service"
+	restart || return 1
+	"$PROG" wait-ready --control "$control_socket" --timeout "$reload_recovery_timeout"
+}
+
+service_triggers() {
+	procd_add_reload_trigger "$NAME"
+}
+
+hot_reload() {
+	reload_service
+}

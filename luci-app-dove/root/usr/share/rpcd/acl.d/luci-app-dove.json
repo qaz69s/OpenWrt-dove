@@ -1,0 +1,36 @@
+{
+	"luci-app-dove": {
+		"description": "Grant UCI and ubus access to LuCI app Dove",
+		"read": {
+			"ubus": {
+				"luci.dove": [
+					"getInitStatus",
+					"getMem",
+					"getLog",
+					"getApiStatus",
+					"getConfig",
+					"getRuntimeOverview"
+				]
+			},
+			"uci": [ "dove" ]
+		},
+		"write": {
+			"ubus": {
+				"luci.dove": [
+					"setInitAction",
+					"clearLog",
+					"login",
+					"forget",
+					"setConfig",
+					"previewConfig"
+				],
+				"uci": [
+					"get",
+					"set",
+					"commit"
+				]
+			},
+			"uci": [ "dove" ]
+		}
+	}
+}

@@ -173,14 +173,28 @@ the configured sink」；绑定 sink 的代码在**产品层**
 拿到带日志的二进制：把 DaeNext 源码切到该分支，然后用 `DOVE_SOURCE_MODE=source`
 编译（或用它编出来的二进制走 `DOVE_SOURCE_MODE=local` / 发 release 资产走 `prebuilt`）。
 
-日志长相（LuCI 日志页直接可见，可按关键字过滤）：
+**两个 UCI 开关**（init 透传成环境变量给 core）：
+
+| UCI | 环境变量 | 默认 | 说明 |
+|---|---|---|---|
+| `dove.settings.log_style` | `DOVE_EVENT_LOG_STYLE` | `logfmt` | `logfmt` = 一行 key=value，LuCI 日志页会解析出时间/级别/outbound/dialer 四列并支持级别过滤；`json` = 原始事件（给采集/脚本） |
+| `dove.settings.log_level` | `DOVE_EVENT_LOG_LEVEL` | `info` | `error/warn/info/debug/trace`。`info` 只记连接/路由级（`tcp_route_chosen`、`dns_path_chosen`、`*_failed`）；`debug` 加上健康检查、worker 启动、UDP 会话等 |
+
+⚠️ `dove.settings.log_level` 与 dae 配置里的 `global.log_level` **无关** —— 后者在
+DaeNext 里默认 `"error"` 且是产品层用的，core 直接吃它几乎记不到任何东西。
+
+日志长相（LuCI 日志页直接渲染）：
 
 ```
 service ready
-{"event":"resident_health_checker_started","group":"proxy","group_policy":"min_moving_avg","candidate_count":1,...}
-{"event":"tcp_worker_started","dial_mode":"domain",...}
-{"event":"tcp_route_chosen","dial_target":"www.google.com:443","dialer":"USA1","final_outbound":2,...}
+time="2026-09-13 00:21:13" level=debug event=resident_health_checker_started msg="health checker started group=telegram policy=fixed candidates=2" group=telegram
+time="2026-09-13 00:21:23" level=info event=tcp_route_chosen msg="tcp4 1.1.1.1 -> proxy via USA1" outbound=proxy dialer=USA1 sniffed=1.1.1.1 dial_target=1.1.1.1:443 policy=min_moving_avg pname=wget
+time="2026-09-13 00:21:24" level=info event=tcp_route_chosen msg="tcp4 www.google.com -> proxy via USA1" outbound=proxy dialer=USA1 sniffed=www.google.com dial_target=www.google.com:443
 ```
+
+> 时间格式特意用空格分隔（`2026-09-13 00:21:13`）：LuCI 日志页用
+> `/\b(\d{2}:\d{2}:\d{2})\b/` 抽时间列，ISO 的 `…T00:21:13` 里 `T` 和 `0` 之间
+> 没有词边界，会抽不到（原版 dae / logrus 就是空格风格，页面是照它写的）。
 
 事件类型全集见 `crates/dae-resident-core/src/events/model.rs`（17 种，含
 `tcp_route_chosen` / `udp_route_chosen` / `dns_path_chosen` / `udp_session_*` / `*_failed`）。

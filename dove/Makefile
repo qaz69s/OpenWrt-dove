@@ -16,7 +16,7 @@ endif
 # apk 版本号格式要求严格：每个点分段必须以数字开头，且 `_` 后缀只接受
 # alpha/beta/pre/rc/cvs/svn/git/hg/p 白名单。所以 PKG_VERSION 只取 tag 的数字主干。
 PKG_VERSION := $(shell echo '$(DOVE_VERSION)' | sed -E 's/^v//; s/[-_].*$$//')
-DOVE_RELEASE ?= 4
+DOVE_RELEASE ?= 6
 PKG_RELEASE := $(DOVE_RELEASE)
 
 PKG_LICENSE    := AGPL-3.0-only

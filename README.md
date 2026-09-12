@@ -60,6 +60,8 @@ luci-app-dove/                          # LuCI 包
 | `/etc/dove/{geoip,geosite}.dat` | 软链到 `/usr/share/v2ray/`（core 的 geodata 目录 = 配置文件所在目录） |
 | `/var/log/dove.log` | 运行日志（core 无内建轮转，init 启动时按 UCI 滚动） |
 | `/var/run/dove.pid` | pidfile（`dove reload` 靠它定位进程） |
+| `/var/run/dove.progress` | 热重载握手文件（run 写进度 / reload 写 SEND 并等 DONE） |
+| `/var/run/dove.abort` | `dove reload -a` 时用来通知断开已有连接 |
 
 ## 命令
 
@@ -72,6 +74,10 @@ dove identity                              # JSON：name/version/…（没有 --
 
 init 提供 `hot_reload`（先 validate，再 `dove reload`；失败自动退化成 stop/start）
 和 `check_config`。
+
+⚠️ run 与 reload 必须共用同一组 `--service-pid-file/--service-progress-file/--service-abort-file`
+（reload 是"写 progress → SIGUSR1 → 等 progress 变 DONE"的握手，路径不一致就会空等到超时）。
+init 两边都从 UCI 取同一组路径。
 
 ## 构建：三种二进制来源
 
@@ -143,5 +149,9 @@ DOVE_CORE_SRC=$HOME/DaeNext DOVE_RUST_TARGET=x86_64-unknown-linux-musl DOVE_JOBS
   另外还会找 `/etc/dae`、`/usr/local/share/dae`、`/usr/share/dae`；本包在
   `/etc/dove/` 和 `/usr/share/dae/` 都放了软链。
 - `dove`（core）**没有** `--version`，取版本用 `dove identity` 的 `version` 字段。
+- **配置文件的权限必须是 0600/0640**。`dove validate` 会拒绝 0644：
+  `permissions 0644 ... are too open; requires the file is NOT writable by the same group and NOT accessible by others`。
+  包的 postinst / uci-defaults / init 每次启动都会 `chmod 0600`；手动 `dove validate`
+  时注意先 chmod，否则会误判成配置错误。
 - daed 那套（deer 包）的启动慢（geodata 贪婪展开 + 每次重建控制面）在这里同样存在，
   因为数据面是同一套；区别只是没有产品层。

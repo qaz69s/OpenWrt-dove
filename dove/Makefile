@@ -55,6 +55,28 @@ DOVE_REPO        ?= qaz69s/DaeNext
 DOVE_CORE_SRC    ?= $(HOME)/DaeNext
 DOVE_JOBS        ?= 2
 
+# 解析期就把"取二进制"的命令算好。
+# ⚠️ 条件指令（ifeq/else）放在 define 里头会失效（make 在展开 define 时
+#    不按顶层条件处理，实测会一直落到 else 分支），所以这里在顶层算。
+# 未用 $(error)：本文件在 make menuconfig 扫描阶段也会被解析，
+# 解析期报错会连累整棵树；这里降级成构建期报错。
+ifeq ($(DOVE_SOURCE_MODE),prebuilt)
+  DOVE_PREPARE_CMD = DOVE_VERSION="$(DOVE_VERSION)" DOVE_REPO="$(DOVE_REPO)" \
+	$(CURDIR)/files/download-dove.sh "$(DOVE_TARGET)" "$(DL_DIR)" "$(PKG_BUILD_DIR)"
+else ifeq ($(DOVE_SOURCE_MODE),local)
+  DOVE_PREPARE_CMD = { [ -f "$(DOVE_CORE_BINARY)" ] || { \
+	echo "Dove: DOVE_CORE_BINARY 不存在或未设置: '$(DOVE_CORE_BINARY)'" >&2; \
+	echo "提示: 需指向 core 二进制（DaeNext 的 daed-contract-runner，见 files/build-core.sh）" >&2; \
+	exit 1; \
+  }; } && install -m 0755 "$(DOVE_CORE_BINARY)" "$(PKG_BUILD_DIR)/dove"
+else ifeq ($(DOVE_SOURCE_MODE),source)
+  DOVE_PREPARE_CMD = DOVE_CORE_SRC="$(DOVE_CORE_SRC)" DOVE_RUST_TARGET="$(DOVE_RUST_TARGET)" \
+	DOVE_JOBS="$(DOVE_JOBS)" DOVE_OUT="$(PKG_BUILD_DIR)/dove" \
+	$(CURDIR)/files/build-core.sh
+else
+  DOVE_PREPARE_CMD = echo "Dove: 未知的 DOVE_SOURCE_MODE='$(DOVE_SOURCE_MODE)'（应为 prebuilt|local|source）" >&2; false
+endif
+
 define Package/dove
   SECTION  := net
   CATEGORY := Network
@@ -98,23 +120,7 @@ define Build/Prepare
 		echo "Dove: 不支持的架构 $(ARCH)，仅支持 aarch64 / x86_64" >&2; \
 		exit 1; \
 	}
-ifeq ($(DOVE_SOURCE_MODE),prebuilt)
-	DOVE_VERSION="$(DOVE_VERSION)" DOVE_REPO="$(DOVE_REPO)" \
-		$(CURDIR)/files/download-dove.sh "$(DOVE_TARGET)" "$(DL_DIR)" "$(PKG_BUILD_DIR)"
-else ifeq ($(DOVE_SOURCE_MODE),local)
-	[ -f "$(DOVE_CORE_BINARY)" ] || { \
-		echo "Dove: DOVE_CORE_BINARY 不存在: $(DOVE_CORE_BINARY)" >&2; \
-		echo "提示: 先跑 ./crossbuild/build-musl.sh 的 core 变体（见 files/build-core.sh）" >&2; \
-		exit 1; \
-	}
-	install -m 0755 "$(DOVE_CORE_BINARY)" "$(PKG_BUILD_DIR)/dove"
-else ifeq ($(DOVE_SOURCE_MODE),source)
-	DOVE_CORE_SRC="$(DOVE_CORE_SRC)" DOVE_RUST_TARGET="$(DOVE_RUST_TARGET)" \
-	DOVE_JOBS="$(DOVE_JOBS)" DOVE_OUT="$(PKG_BUILD_DIR)/dove" \
-		$(CURDIR)/files/build-core.sh
-else
-	$(error Dove: 未知的 DOVE_SOURCE_MODE=$(DOVE_SOURCE_MODE)（prebuilt|local|source）)
-endif
+	$(DOVE_PREPARE_CMD)
 endef
 
 define Build/Configure
@@ -122,6 +128,11 @@ endef
 
 define Build/Compile
 endef
+
+# 二进制由 cargo 产出时已经 strip 过（静态 musl + strip）。关掉 OpenWrt 的
+# 二次 strip（RSTRIP），保证包内 /usr/bin/dove 与构建产物逐字节一致、可校验，
+# 也避免对 native-ebpf 内嵌 BPF 对象做任何多余加工。
+RSTRIP:=:
 
 define Package/dove/install
 	$(INSTALL_DIR) $(1)/usr/bin

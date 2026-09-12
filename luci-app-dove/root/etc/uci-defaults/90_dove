@@ -17,9 +17,12 @@ touch /var/log/dove.log 2>/dev/null || true
 
 # geodata：core 的 geodata 目录 = 配置文件所在目录（/etc/dove），
 # 同时给 /usr/share/dae 兜底（GeodataResolver 的固定搜索路径之一）。
-ln -sf ../v2ray/geoip.dat   /etc/dove/geoip.dat    2>/dev/null || true
-ln -sf ../v2ray/geosite.dat /etc/dove/geosite.dat  2>/dev/null || true
+# /etc/dove 用绝对目标（相对路径会算错，见 dove/Makefile 注释）；
+# 悬空软链在 -e 判断下为假，所以这里能自动纠正旧版的错链。
+[ -e /etc/dove/geoip.dat ]   || ln -sf /usr/share/v2ray/geoip.dat   /etc/dove/geoip.dat   2>/dev/null || true
+[ -e /etc/dove/geosite.dat ] || ln -sf /usr/share/v2ray/geosite.dat /etc/dove/geosite.dat 2>/dev/null || true
 mkdir -p /usr/share/dae
+# /usr/share/dae 的 ../v2ray 是对的（同为 /usr/share 下）
 [ -e /usr/share/dae/geoip.dat ]   || ln -sf ../v2ray/geoip.dat   /usr/share/dae/geoip.dat   2>/dev/null || true
 [ -e /usr/share/dae/geosite.dat ] || ln -sf ../v2ray/geosite.dat /usr/share/dae/geosite.dat 2>/dev/null || true
 

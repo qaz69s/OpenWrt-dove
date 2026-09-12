@@ -16,7 +16,7 @@ endif
 # apk 版本号格式要求严格：每个点分段必须以数字开头，且 `_` 后缀只接受
 # alpha/beta/pre/rc/cvs/svn/git/hg/p 白名单。所以 PKG_VERSION 只取 tag 的数字主干。
 PKG_VERSION := $(shell echo '$(DOVE_VERSION)' | sed -E 's/^v//; s/[-_].*$$//')
-DOVE_RELEASE ?= 1
+DOVE_RELEASE ?= 2
 PKG_RELEASE := $(DOVE_RELEASE)
 
 PKG_LICENSE    := AGPL-3.0-only
@@ -143,9 +143,12 @@ define Package/dove/install
 
 	$(INSTALL_DIR) $(1)/etc/dove
 	$(INSTALL_CONF) $(CURDIR)/files/config.dae $(1)/etc/dove/config.dae
-	# core 的 geodata 目录 = 配置文件所在目录（resident_config_geodata_asset_dirs）
-	$(LN) ../v2ray/geoip.dat $(1)/etc/dove/geoip.dat
-	$(LN) ../v2ray/geosite.dat $(1)/etc/dove/geosite.dat
+	# core 的 geodata 目录 = 配置文件所在目录（resident_config_geodata_asset_dirs）。
+	# ⚠️ 这里必须用绝对目标：从 /etc/dove 到 /usr/share/v2ray 的相对路径是
+	#    ../../usr/share/v2ray/...，上一版写成 ../v2ray/... 会被解析成 /etc/v2ray/...，
+	#    结果是悬空软链（geodata 解析失败）。
+	$(LN) /usr/share/v2ray/geoip.dat $(1)/etc/dove/geoip.dat
+	$(LN) /usr/share/v2ray/geosite.dat $(1)/etc/dove/geosite.dat
 
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) $(CURDIR)/files/dove.init $(1)/etc/init.d/dove

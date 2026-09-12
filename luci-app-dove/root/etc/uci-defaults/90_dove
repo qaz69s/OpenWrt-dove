@@ -2,27 +2,26 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 #
 # uci-defaults: luci-app-dove 首次安装初始化
-# dove 包已经装好 /etc/init.d/dove、/etc/config/dove、/usr/bin/dove；
-# 这里只处理权限、目录、软链与自启。
+# dove 包已经装好 /etc/init.d/dove、/etc/config/dove、/etc/dove/config.dae
+# 和 /usr/bin/dove；这里只处理权限、目录、软链与自启。
 
 # rpcd helper 权限（个别构建里安装后可能不是 755）
 chmod 0755 /usr/libexec/rpcd/luci.dove 2>/dev/null || true
 
-# daed 配置目录：仅 root 可读（内含 daed.db、配置快照与 API 凭据）
-mkdir -p /etc/dove
+# 配置目录与日志
+mkdir -p /etc/dove /var/log
 chmod 0700 /etc/dove 2>/dev/null || true
+# 配置里可能有节点密码，收紧权限（init 每次启动也会再 chmod 一次）
+chmod 0600 /etc/dove/config.dae 2>/dev/null || true
+touch /var/log/dove.log 2>/dev/null || true
 
-# 本地控制 socket 目录与产品日志目录（/tmp 是 tmpfs，重启即清空）
-mkdir -p /run/dove /tmp/log/dove
-chmod 0700 /run/dove 2>/dev/null || true
-
-# geodata 软链：/usr/share/dove 是 dove 的 geodata_dir（init 会通过 DAE_LOCATION_ASSET
-# 传给 daed）；/usr/share/daed 是 daed 的默认搜索目录，做兜底。
-mkdir -p /usr/share/dove /usr/share/daed
-ln -sf ../v2ray/geoip.dat   /usr/share/dove/geoip.dat    2>/dev/null || true
-ln -sf ../v2ray/geosite.dat /usr/share/dove/geosite.dat  2>/dev/null || true
-[ -e /usr/share/daed/geoip.dat ]   || ln -sf ../v2ray/geoip.dat   /usr/share/daed/geoip.dat   2>/dev/null || true
-[ -e /usr/share/daed/geosite.dat ] || ln -sf ../v2ray/geosite.dat /usr/share/daed/geosite.dat 2>/dev/null || true
+# geodata：core 的 geodata 目录 = 配置文件所在目录（/etc/dove），
+# 同时给 /usr/share/dae 兜底（GeodataResolver 的固定搜索路径之一）。
+ln -sf ../v2ray/geoip.dat   /etc/dove/geoip.dat    2>/dev/null || true
+ln -sf ../v2ray/geosite.dat /etc/dove/geosite.dat  2>/dev/null || true
+mkdir -p /usr/share/dae
+[ -e /usr/share/dae/geoip.dat ]   || ln -sf ../v2ray/geoip.dat   /usr/share/dae/geoip.dat   2>/dev/null || true
+[ -e /usr/share/dae/geosite.dat ] || ln -sf ../v2ray/geosite.dat /usr/share/dae/geosite.dat 2>/dev/null || true
 
 # 让 rpcd 立刻加载新的 ACL / helper
 /etc/init.d/rpcd restart

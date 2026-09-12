@@ -3,31 +3,21 @@
 #
 # rpcd helper for luci-app-dove
 #
-# Dove 跑的是 DaeNext 的 daed：它的配置实体在 SQLite（/etc/dove/daed.db），
-# 不读 config.dae 文本。所以「joey 式的文本配置体验」由这里通过 daed 的 REST
-# 接口实现：
-#   GET  /api/user/me/dae-config-file   导出当前运行时配置（dae 文本）
-#   PUT  /api/user/me/dae-config-file   导入配置（建/替换节点、订阅、分组、路由、DNS）
-#   POST /api/profiles/select           把导入出来的 config/dns/routing 设为选中
-#   POST /api/runtime/reload            物化并应用（相当于 dae reload）
-#   POST /api/user/me/dae-config-file/preview  只校验不落库
-#
-# 认证：首启（numberUsers=0）自动建一个本地用户并把随机密码存到
-# /etc/dove/api.cred（0600），token 缓存在 /run/dove/api.token（tmpfs）。
-# 已有用户（例如用户自己在面板上建过账号）但不认这套凭据时，页面会要求登录。
+# Dove 跑的是 DaeNext 的 **core only** 二进制（无 product-api：没有 SQLite、没有
+# REST、没有 Web UI）。所以这里的胶水比 deer 简单得多 —— 配置就是一份文本文件
+# （/etc/dove/config.dae），LuCI 通过 fs.read/fs.write 直接读写，
+# 这个 helper 只负责状态/日志/服务控制/配置校验。
 #
 # ubus -v list luci.dove
-# ubus call luci.dove getConfig
+# ubus call luci.dove getInitStatus '{"name":"dove"}'
+# ubus call luci.dove validateConfig
 
 readonly NAME=dove
 readonly PROG=/usr/bin/dove
-readonly DEFAULT_LOG_DIR=/tmp/log/dove
+readonly DEFAULT_CONFIG_FILE=/etc/dove/config.dae
+readonly DEFAULT_LOG=/var/log/dove.log
+readonly DEFAULT_PID_FILE=/var/run/dove.pid
 readonly LOG_LINES=400
-readonly CRED_FILE=/etc/dove/api.cred
-readonly TOKEN_CACHE=/run/dove/api.token
-readonly API_USER=dove
-# 导入时统一用固定前缀，重复导入会替换同名资源而不是无限累积
-readonly IMPORT_PREFIX=dove
 
 . /lib/functions.sh
 . /usr/share/libubox/jshn.sh
@@ -39,140 +29,27 @@ is_running()      { [ "$(ubus call service list "{ 'name': '$1' }" \
 print_json_bool() { json_init; json_add_boolean "$1" "$2"; json_dump; json_cleanup; }
 print_error()     { json_init; json_add_boolean 'ok' '0'; json_add_string 'error' "$1"; json_dump; json_cleanup; }
 
-get_version() {
-	[ -x "$PROG" ] || { echo ''; return 0; }
-	"$PROG" --version 2>/dev/null | awk 'NR==1{print $4}'
-}
-
-_get_dove_pid() {
-	local pid
-	pid="$(pidof dove 2>/dev/null | awk '{print $1}')"
-	[ -z "$pid" ] && pid="$(ps 2>/dev/null | awk '$0~/[d]ove run/{print $1; exit}')"
-	echo "$pid"
-}
-
 uci_get() {
 	local v
-	v="$(uci -q get "$NAME.main.$1")"
+	v="$(uci -q get "$NAME.settings.$1")"
 	[ -n "$v" ] && echo "$v"
 }
 
-log_dir() {
-	local d
-	d="$(uci_get log_dir)"
-	echo "${d:-$DEFAULT_LOG_DIR}"
+config_file() { local v; v="$(uci_get config_file)"; echo "${v:-$DEFAULT_CONFIG_FILE}"; }
+log_file()    { local v; v="$(uci_get log_file)";    echo "${v:-$DEFAULT_LOG}"; }
+pid_file()    { local v; v="$(uci_get pid_file)";    echo "${v:-$DEFAULT_PID_FILE}"; }
+
+_get_dove_pid() {
+	local pid=""
+	[ -r "$(pid_file)" ] && pid="$(cat "$(pid_file)" 2>/dev/null)"
+	[ -z "$pid" ] && pid="$(pidof dove 2>/dev/null | awk '{print $1}')"
+	echo "$pid"
 }
 
-# ── daed REST 接口 ────────────────────────────────────────────────────────────
-# listen 可能是 0.0.0.0:2023 / 127.0.0.1:2023 / [::]:2023 / 2023
-api_endpoint() {
-	local listen host port
-	listen="$(uci_get listen)"
-	[ -n "$listen" ] || listen="127.0.0.1:2023"
-	case "$listen" in
-		\[*\]:*) host="${listen%%\]:*}"; host="$host]"; port="${listen##*:}" ;;
-		*:*)     host="${listen%:*}"; port="${listen##*:}" ;;
-		*)       host="127.0.0.1"; port="$listen" ;;
-	esac
-	[ -n "$port" ] || port=2023
-	case "$host" in
-		""|0.0.0.0|"::"|"[::]"|"*") host="127.0.0.1" ;;
-		*:*) [ "${host#\[}" = "$host" ] && host="[$host]" ;;
-	esac
-	echo "http://$host:$port"
-}
-
-# curl 包装：统一静默、限时、返回 body（失败时 body 为空，调用方看 exit code）
-api_curl() {
-	curl -sS --max-time "${DOVE_API_TIMEOUT:-180}" "$@" 2>/dev/null
-}
-
-api_code() {
-	curl -sS --max-time "${DOVE_API_TIMEOUT:-180}" -o /dev/null -w '%{http_code}' "$@" 2>/dev/null
-}
-
-json_field() { jsonfilter -s "$1" -e "$2" 2>/dev/null; }
-
-gen_password() {
-	# 32 位十六进制随机密码（od 在 busybox 里一定有，hexdump 不一定）
-	od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n'
-}
-
-api_user_count() {
-	local resp
-	resp="$(api_curl "$(api_endpoint)/api/auth/status")" || return 1
-	json_field "$resp" '@.numberUsers'
-}
-
-api_login() {
-	local user="$1" pass="$2" resp
-	resp="$(api_curl -X POST "$(api_endpoint)/api/auth/token" \
-		-H 'Content-Type: application/json' \
-		--data "$(json_create_token_body "$user" "$pass")")" || return 1
-	json_field "$resp" '@.token'
-}
-
-api_create_user() {
-	local user="$1" pass="$2" resp
-	resp="$(api_curl -X POST "$(api_endpoint)/api/auth/users" \
-		-H 'Content-Type: application/json' \
-		--data "$(json_create_token_body "$user" "$pass")")" || return 1
-	json_field "$resp" '@.token'
-}
-
-json_create_token_body() {
-	json_init
-	json_add_string 'username' "$1"
-	json_add_string 'password' "$2"
-	json_dump
-	json_cleanup
-}
-
-# 返回可用 token（缓存 → 凭据 → 首启自动建用户），失败返回空
-api_token() {
-	local t code
-	if [ -s "$TOKEN_CACHE" ]; then
-		t="$(cat "$TOKEN_CACHE")"
-		code="$(api_code -H "Authorization: Bearer $t" "$(api_endpoint)/api/user/me")"
-		if [ "$code" = "200" ]; then
-			echo "$t"
-			return 0
-		fi
-		rm -f "$TOKEN_CACHE"
-	fi
-
-	if [ -f "$CRED_FILE" ]; then
-		t="$(api_login "$(cut -d: -f1 "$CRED_FILE")" "$(cut -d: -f2- "$CRED_FILE")")"
-		if [ -n "$t" ]; then
-			_save_token "$t"
-			echo "$t"
-			return 0
-		fi
-	fi
-
-	if [ "$(api_user_count)" = "0" ]; then
-		local pass
-		pass="$(gen_password)"
-		[ -n "$pass" ] || return 1
-		t="$(api_create_user "$API_USER" "$pass")"
-		if [ -n "$t" ]; then
-			umask 077
-			printf '%s:%s' "$API_USER" "$pass" >"$CRED_FILE"
-			chmod 0600 "$CRED_FILE" 2>/dev/null || true
-			_save_token "$t"
-			echo "$t"
-			return 0
-		fi
-	fi
-
-	return 1
-}
-
-_save_token() {
-	mkdir -p "$(dirname "$TOKEN_CACHE")" 2>/dev/null
-	umask 077
-	printf '%s' "$1" >"$TOKEN_CACHE"
-	chmod 0600 "$TOKEN_CACHE" 2>/dev/null || true
+# core 没有 --version，用 `dove identity` 的 version 字段
+get_version() {
+	[ -x "$PROG" ] || { echo ''; return 0; }
+	"$PROG" identity 2>/dev/null | jsonfilter -e '@.version' 2>/dev/null
 }
 
 # ── 状态 ──────────────────────────────────────────────────────────────────────
@@ -207,215 +84,60 @@ get_init_status() {
 	json_add_object "$name"
 	if is_enabled "$name"; then json_add_boolean 'enabled' '1'
 	else                        json_add_boolean 'enabled' '0'; fi
-	json_add_boolean 'running'   "$running"
-	json_add_string  'version'   "$version"
+	json_add_boolean 'running'  "$running"
+	json_add_string  'version'  "$version"
 	[ -n "$version" ] && json_add_boolean 'installed' '1' || json_add_boolean 'installed' '0'
-	json_add_int     'uptime'    "${uptime:-0}"
-	json_add_string  'mem'       "${mem:-0}"
-	json_add_string  'listen'    "$(uci_get listen)"
-	json_add_string  'web_root'  "$(uci_get web_root)"
-	json_add_string  'log_dir'   "$(log_dir)"
-	json_add_string  'endpoint'  "$(api_endpoint)"
-	[ "$(uci_get api_only)" = "1" ] && json_add_boolean 'api_only' '1' || json_add_boolean 'api_only' '0'
-	[ -f "$CRED_FILE" ] && json_add_boolean 'api_credential' '1' || json_add_boolean 'api_credential' '0'
+	json_add_int     'uptime'   "${uptime:-0}"
+	json_add_string  'mem'      "${mem:-0}"
+	json_add_string  'config'   "$(config_file)"
+	json_add_string  'log'      "$(log_file)"
+	json_add_string  'pid'      "$(_get_dove_pid)"
 	json_close_object
 	json_dump; json_cleanup
 }
 
 get_mem() {
-	local pid mem
-	pid="$(_get_dove_pid)"
+	local pid="$( _get_dove_pid )" mem
 	[ -n "$pid" ] && mem="$(get_proc_mem_mb "$pid")"
 	json_init
 	json_add_string 'mem' "${mem:-0}"
 	json_dump; json_cleanup
 }
 
-# ── daed 运行态（REST）────────────────────────────────────────────────────────
-get_api_status() {
-	local t count code
-	t="$(api_token)"
-	count="$(api_user_count)"
+# 完整 identity JSON（诊断用）
+get_identity() {
+	[ -x "$PROG" ] || { print_error "$PROG not found"; return 0; }
+	local raw; raw="$("$PROG" identity 2>/dev/null)"
+	[ -n "$raw" ] || { print_error 'identity command failed'; return 0; }
 	json_init
 	json_add_boolean 'ok' '1'
-	json_add_string  'endpoint' "$(api_endpoint)"
-	json_add_string  'numberUsers' "${count:-0}"
-	[ -n "$t" ] && json_add_boolean 'authenticated' '1' || json_add_boolean 'authenticated' '0'
-	[ -f "$CRED_FILE" ] && json_add_boolean 'api_credential' '1' || json_add_boolean 'api_credential' '0'
-	code="$(api_code "$(api_endpoint)/api/health")"
-	json_add_string 'health' "${code:-000}"
+	json_add_string  'raw' "$raw"
+	json_add_string  'version' "$(jsonfilter -s "$raw" -e '@.version' 2>/dev/null)"
 	json_dump; json_cleanup
 }
 
-login() {
-	local user="$1" pass="$2" remember="$3" t
-	[ -n "$user" ] || { print_error 'username is required'; return 0; }
-	t="$(api_login "$user" "$pass")"
-	if [ -z "$t" ]; then
-		print_error '登录失败：用户名或密码不正确（或 daed API 尚未就绪）'
-		return 0
-	fi
-	_save_token "$t"
-	if [ "$remember" = "1" ]; then
+# 校验配置：不带参数校验现网配置；带 content 校验未保存的文本
+validate_config() {
+	local content="$1" target tmp ok=0 err=''
+	target="$(config_file)"
+	if [ -n "$content" ]; then
+		tmp="/tmp/dove-validate.$$.dae"
 		umask 077
-		printf '%s:%s' "$user" "$pass" >"$CRED_FILE"
-		chmod 0600 "$CRED_FILE" 2>/dev/null || true
+		printf '%s\n' "$content" > "$tmp" || { print_error 'cannot write temp file'; return 0; }
+		target="$tmp"
 	fi
-	json_init
-	json_add_boolean 'ok' '1'
-	json_add_boolean 'remembered' "$remember"
-	json_dump; json_cleanup
-}
-
-forget() {
-	rm -f "$TOKEN_CACHE" "$CRED_FILE"
-	print_json_bool 'ok' '1'
-}
-
-# 导出当前生效的 dae 配置文本
-get_config() {
-	local t resp code
-	t="$(api_token)"
-	[ -n "$t" ] || { print_error '无法通过 daed API 认证（服务未就绪或缺凭据，请先登录）'; return 0; }
-	resp="$(api_curl -H "Authorization: Bearer $t" "$(api_endpoint)/api/user/me/dae-config-file")"
-	code="$?"
-	if [ -z "$resp" ] || [ "$code" != "0" ]; then
-		print_error '导出配置失败：daed API 无响应（服务可能仍在启动，首次启动需等待运行时物化）'
-		return 0
+	if out="$("$PROG" validate -c "$target" 2>&1)"; then
+		ok=1
+	else
+		err="$out"
+		[ -n "$err" ] || err='validate failed'
 	fi
-	case "$resp" in
-		*'"error":'*) print_error "导出配置失败：$(json_field "$resp" '@.error')"; return 0 ;;
-	esac
-
-	local content filename
-	content="$(json_field "$resp" '@.content')"
-	filename="$(json_field "$resp" '@.filename')"
-	if [ -z "$content" ]; then
-		# 空库（还没导入过任何配置）时没有可导出的内容，属正常状态
-		json_init
-		json_add_boolean 'ok' '1'
-		json_add_boolean 'empty' '1'
-		json_add_string  'content' ''
-		json_add_string  'filename' "${filename:-generated.dae}"
-		json_dump; json_cleanup
-		return 0
-	fi
-	json_init
-	json_add_boolean 'ok' '1'
-	json_add_boolean 'empty' '0'
-	json_add_string  'content' "$content"
-	json_add_string  'filename' "${filename:-generated.dae}"
-	json_dump; json_cleanup
-}
-
-# 只校验（不落库）
-preview_config() {
-	local content="$1" t resp
-	t="$(api_token)"
-	[ -n "$t" ] || { print_error '无法通过 daed API 认证（服务未就绪或缺凭据，请先登录）'; return 0; }
-	json_init
-	json_add_string 'content' "$content"
-	json_add_string 'namePrefix' "$IMPORT_PREFIX"
-	local body; body="$(json_dump)"; json_cleanup
-
-	resp="$(api_curl -X POST "$(api_endpoint)/api/user/me/dae-config-file/preview" \
-		-H "Authorization: Bearer $t" -H 'Content-Type: application/json' --data "$body")"
-	case "$resp" in
-		*'"error":'*)
-			print_error "配置校验失败：$(json_field "$resp" '@.error')"
-			return 0 ;;
-	esac
-	json_init
-	json_add_boolean 'ok' '1'
-	json_add_string  'warnings' "$(json_field "$resp" '@.warnings[*].message' | tr '\n' ';')"
-	json_add_string  'raw' "$resp"
-	json_dump; json_cleanup
-}
-
-# 导入 → 选中 → reload（= joey 的「保存 + 热重载」）
-set_config() {
-	local content="$1" do_reload="$2" t resp body code
-	t="$(api_token)"
-	[ -n "$t" ] || { print_error '无法通过 daed API 认证（服务未就绪或缺凭据，请先登录）'; return 0; }
+	[ -n "$tmp" ] && rm -f "$tmp"
 
 	json_init
-	json_add_string 'content' "$content"
-	json_add_string 'namePrefix' "$IMPORT_PREFIX"
-	body="$(json_dump)"; json_cleanup
-
-	resp="$(api_curl -X PUT "$(api_endpoint)/api/user/me/dae-config-file" \
-		-H "Authorization: Bearer $t" -H 'Content-Type: application/json' --data "$body")"
-	if [ -z "$resp" ]; then
-		print_error '导入失败：daed API 无响应'
-		return 0
-	fi
-	case "$resp" in
-		*'"error":'*) print_error "导入失败：$(json_field "$resp" '@.error')"; return 0 ;;
-	esac
-
-	local cid did rid
-	cid="$(json_field "$resp" '@.defaults.configId')"
-	did="$(json_field "$resp" '@.defaults.dnsId')"
-	rid="$(json_field "$resp" '@.defaults.routingId')"
-
-	# 导入不会自动选中，必须显式 select，否则运行时还挂在旧配置上
-	local selected='0' select_error=''
-	if [ -n "$cid" ] && [ -n "$did" ] && [ -n "$rid" ]; then
-		json_init
-		json_add_int 'configId' "$cid"
-		json_add_int 'dnsId' "$did"
-		json_add_int 'routingId' "$rid"
-		body="$(json_dump)"; json_cleanup
-		local sresp
-		sresp="$(api_curl -X POST "$(api_endpoint)/api/profiles/select" \
-			-H "Authorization: Bearer $t" -H 'Content-Type: application/json' --data "$body")"
-		case "$sresp" in
-			*'"error":'*) select_error="$(json_field "$sresp" '@.error')" ;;
-			*) selected='1' ;;
-		esac
-	fi
-
-	local reloaded='0' reload_error='' reload_body=''
-	if [ "$do_reload" != "0" ] && [ "$selected" = "1" ]; then
-		reload_body="$(api_curl -X POST "$(api_endpoint)/api/runtime/reload" \
-			-H "Authorization: Bearer $t" -H 'Content-Type: application/json' --data '{}')"
-		case "$reload_body" in
-			*'"error":'*) reload_error="$(json_field "$reload_body" '@.error')" ;;
-			'')          reload_error='daed API 无响应' ;;
-			*)           reloaded='1' ;;
-		esac
-	fi
-
-	json_init
-	json_add_boolean 'ok' "$selected"
-	json_add_boolean 'imported' '1'
-	json_add_boolean 'selected' "$selected"
-	json_add_boolean 'reloaded' "$reloaded"
-	json_add_string  'warnings' "$(json_field "$resp" '@.warnings[*].message' | tr '\n' ';')"
-	json_add_string  'selectError' "$select_error"
-	json_add_string  'reloadError' "$reload_error"
-	json_add_int     'configId' "${cid:-0}"
-	json_add_int     'dnsId' "${did:-0}"
-	json_add_int     'routingId' "${rid:-0}"
-	json_add_string  'reloadReport' "$(printf '%s' "$reload_body" | cut -c1-2000)"
-	json_dump; json_cleanup
-}
-
-get_runtime_overview() {
-	local t resp code
-	t="$(api_token)"
-	[ -n "$t" ] || { print_error 'daed API 未就绪或未认证'; return 0; }
-	resp="$(api_curl -H "Authorization: Bearer $t" "$(api_endpoint)/api/runtime/overview")"
-	code="$?"
-	if [ -z "$resp" ] || [ "$code" != "0" ]; then
-		print_error 'daed API 无响应'; return 0
-	fi
-	case "$resp" in
-		*'"error":'*) print_error "$(json_field "$resp" '@.error')"; return 0 ;;
-	esac
-	json_init
-	json_add_boolean 'ok' '1'
-	json_add_string  'raw' "$resp"
+	json_add_boolean 'ok' "$ok"
+	json_add_string  'error' "$err"
+	json_add_string  'target' "$target"
 	json_dump; json_cleanup
 }
 
@@ -424,12 +146,12 @@ get_log() {
 	local source="$1" path lines=''
 	case "$source" in
 		syslog)
-			path="logread | grep -iE 'dove|daed'"
-			lines="$(logread 2>/dev/null | grep -iE 'dove|daed' | tail -n "$LOG_LINES")"
+			path="logread | grep -iE 'dove'"
+			lines="$(logread 2>/dev/null | grep -iE 'dove' | tail -n "$LOG_LINES")"
 			;;
 		*)
-			source="product"
-			path="$(log_dir)/current.jsonl"
+			source="core"
+			path="$(log_file)"
 			[ -f "$path" ] && lines="$(tail -n "$LOG_LINES" "$path" 2>/dev/null)"
 			;;
 	esac
@@ -441,7 +163,7 @@ get_log() {
 }
 
 clear_log() {
-	local file; file="$(log_dir)/current.jsonl"
+	local file; file="$(log_file)"
 	if [ -f "$file" ]; then
 		if : > "$file" 2>/dev/null; then print_json_bool "result" '1'
 		else                            print_json_bool "result" '0'; fi
@@ -481,30 +203,18 @@ case "$1" in
 		json_add_object "getMem"
 			json_add_string 'name' "name"
 		json_close_object
-		json_add_object "setInitAction"
-			json_add_string 'name'   "name"
-			json_add_string 'action' "action"
-		json_close_object
+		json_add_object "getIdentity"; json_close_object
 		json_add_object "getLog"
 			json_add_string 'source' "source"
 		json_close_object
 		json_add_object "clearLog"; json_close_object
-		json_add_object "getApiStatus"; json_close_object
-		json_add_object "login"
-			json_add_string 'username' "username"
-			json_add_string 'password' "password"
-			json_add_string 'remember' "remember"
-		json_close_object
-		json_add_object "forget"; json_close_object
-		json_add_object "getConfig"; json_close_object
-		json_add_object "setConfig"
-			json_add_string 'content' "content"
-			json_add_string 'reload'  "reload"
-		json_close_object
-		json_add_object "previewConfig"
+		json_add_object "validateConfig"
 			json_add_string 'content' "content"
 		json_close_object
-		json_add_object "getRuntimeOverview"; json_close_object
+		json_add_object "setInitAction"
+			json_add_string 'name'   "name"
+			json_add_string 'action' "action"
+		json_close_object
 		json_dump; json_cleanup
 		;;
 	call)
@@ -519,41 +229,21 @@ case "$1" in
 				json_get_var name 'name'; json_cleanup
 				[ "$name" = "$NAME" ] || { print_json_bool "result" '0'; exit 0; }
 				get_mem "$name" ;;
-			setInitAction)
-				read -r input; json_load "$input"
-				json_get_var action 'action'; json_cleanup
-				set_init_action "$action" ;;
+			getIdentity)
+				get_identity ;;
 			getLog)
 				read -r input; json_load "$input"
 				json_get_var source 'source'; json_cleanup
 				get_log "$source" ;;
 			clearLog)
 				clear_log ;;
-			getApiStatus)
-				get_api_status ;;
-			login)
+			validateConfig)
 				read -r input; json_load "$input"
-				json_get_var username 'username'
-				json_get_var password 'password'
-				json_get_var remember 'remember'
-				json_cleanup
-				login "$username" "$password" "$remember" ;;
-			forget)
-				forget ;;
-			getConfig)
-				get_config ;;
-			setConfig)
+				json_get_var content 'content'; json_cleanup
+				validate_config "$content" ;;
+			setInitAction)
 				read -r input; json_load "$input"
-				json_get_var content 'content'
-				json_get_var reload  'reload'
-				json_cleanup
-				set_config "$content" "$reload" ;;
-			previewConfig)
-				read -r input; json_load "$input"
-				json_get_var content 'content'
-				json_cleanup
-				preview_config "$content" ;;
-			getRuntimeOverview)
-				get_runtime_overview ;;
+				json_get_var action 'action'; json_cleanup
+				set_init_action "$action" ;;
 		esac ;;
 esac

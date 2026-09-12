@@ -1,0 +1,78 @@
+# Dove (DaeNext core) 配置 —— 语法与上游 dae 的 config.dae 一致。
+#
+# LuCI「配置」页编辑的就是这个文件：保存 → /etc/init.d/dove hot_reload
+# （先 `dove validate`，再对进程发 SIGUSR1 热重载，不断连接）。
+#
+# 现装现用：下面是一份"只直连"的安全默认（不代理任何流量），
+# 需要代理时按注释里的示例填 node / subscription / group，然后把
+# routing 的 fallback 换成分组名。
+
+global {
+	# 关掉"拉订阅前等网络"。默认 false 时，只要配了 subscription，
+	# 启动和重载都会先探测网络（每次 5s 超时、最多 60 轮）—— 首启慢的主因之一。
+	disable_waiting_network: true
+	log_level: "info"
+	# 内核参数/防火墙自动配置（eBPF 透明代理通常要保持开着）
+	auto_config_kernel_parameter: true
+	wan_interface: "auto"
+}
+
+routing {
+	# ⚠️ 下面这几条必须保留：本机/内网/组播流量直连。
+	# 少了它们，数据面会把发往路由器自身的管理流量（SSH 22 / LuCI 80）一起劫持，
+	# 表现为 TCP 能连上但握手被 reset。
+	dip(192.168.0.0/16) -> must_direct
+	dip(10.0.0.0/8) -> must_direct
+	dip(172.16.0.0/12) -> must_direct
+	dport(67, 68) -> must_direct
+	dip(224.0.0.0/3) -> must_direct
+	dip("ff00::/8") -> must_direct
+	dip(geoip:private) -> must_direct
+
+	# ── 代理规则示例（按需启用）──
+	# pname("dnsmasq") -> must_direct
+	# domain(geosite:cn) -> direct
+	# dip(geoip:cn) -> direct
+	# domain(geosite:category-ads-all) -> block
+	# fallback: my_group
+
+	# 没配节点/分组时保持直连，避免开了服务就断网
+	fallback: direct
+}
+
+# ── 节点示例 ──
+# node {
+# 	hkg: "ss://..."
+# 	jp: "vless://...?security=reality&sni=..."
+# 	chain: "tuic://... -> vmess://..."
+# }
+
+# ── 订阅示例（二选一即可，也可同时存在）──
+# subscription {
+# 	my_sub: "https://example.com/sub?token=..."
+# }
+
+# ── 分组示例（routing 的 fallback 填分组名）──
+# group {
+# 	my_group {
+# 		filter: subtag("my_sub")
+# 		policy: "min_moving_avg"
+# 	}
+# }
+
+# ── DNS ──
+# dns {
+# 	upstream {
+# 		alidns: "udp://223.5.5.5:53"
+# 		googledns: "tcp+udp://8.8.8.8:53"
+# 	}
+# 	routing {
+# 		request {
+# 			qname(geosite:cn) -> alidns
+# 			fallback: googledns
+# 		}
+# 		response {
+# 			fallback: accept
+# 		}
+# 	}
+# }

@@ -1,16 +1,18 @@
 {
 	"luci-app-dove": {
-		"description": "Grant UCI and ubus access to LuCI app Dove",
+		"description": "Grant UCI, ubus and config-file access to LuCI app Dove",
 		"read": {
 			"ubus": {
 				"luci.dove": [
 					"getInitStatus",
 					"getMem",
-					"getLog",
-					"getApiStatus",
-					"getConfig",
-					"getRuntimeOverview"
+					"getIdentity",
+					"getLog"
 				]
+			},
+			"file": {
+				"/etc/dove/config.dae": [ "read" ],
+				"/var/log/dove.log": [ "read" ]
 			},
 			"uci": [ "dove" ]
 		},
@@ -19,16 +21,17 @@
 				"luci.dove": [
 					"setInitAction",
 					"clearLog",
-					"login",
-					"forget",
-					"setConfig",
-					"previewConfig"
+					"validateConfig"
 				],
 				"uci": [
 					"get",
 					"set",
 					"commit"
 				]
+			},
+			"file": {
+				"/etc/dove/config.dae": [ "write" ],
+				"/var/log/dove.log": [ "write" ]
 			},
 			"uci": [ "dove" ]
 		}

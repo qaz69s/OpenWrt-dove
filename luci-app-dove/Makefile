@@ -4,12 +4,11 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-dove
 PKG_VERSION:=0.1.0
-PKG_RELEASE:=2
+PKG_RELEASE:=3
 
-LUCI_TITLE:=LuCI app for Dove (DaeNext core only)
-LUCI_DESCRIPTION:=Joey-style LuCI pages for Dove: edit /etc/dove/config.dae of a \
-	running DaeNext core (no daed product layer, no REST API) instance, plus \
-	service status, config validation and logs.
+LUCI_TITLE:=LuCI app for Dove
+LUCI_DESCRIPTION:=Joey-style LuCI pages (single page, 3 tabs) for Dove: \
+	edit the dae config text at /etc/dove/config.dae, service status and logs.
 LUCI_DEPENDS:=+luci-base +dove
 LUCI_PKGARCH:=all
 

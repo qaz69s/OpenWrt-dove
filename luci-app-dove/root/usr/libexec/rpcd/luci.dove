@@ -1,60 +1,37 @@
 #!/bin/sh
-# SPDX-License-Identifier: AGPL-3.0-only
-#
-# rpcd helper for luci-app-dove
-#
-# Dove 跑的是 DaeNext 的 **core only** 二进制（无 product-api：没有 SQLite、没有
-# REST、没有 Web UI）。所以这里的胶水比 deer 简单得多 —— 配置就是一份文本文件
-# （/etc/dove/config.dae），LuCI 通过 fs.read/fs.write 直接读写，
-# 这个 helper 只负责状态/日志/服务控制/配置校验。
-#
-# ubus -v list luci.dove
-# ubus call luci.dove getInitStatus '{"name":"dove"}'
-# ubus call luci.dove validateConfig
 
-readonly NAME=dove
-readonly PROG=/usr/bin/dove
-readonly DEFAULT_CONFIG_FILE=/etc/dove/config.dae
-readonly DEFAULT_LOG=/var/log/dove.log
-readonly DEFAULT_PID_FILE=/var/run/dove.pid
-readonly LOG_LINES=400
+readonly NAME="dove"
+readonly PROG="/usr/bin/dove"
+readonly LOG="/var/log/dove.log"
 
 . /lib/functions.sh
 . /usr/share/libubox/jshn.sh
 
-is_enabled()      { "/etc/init.d/${1}" enabled >/dev/null 2>&1; }
+is_enabled()      { "/etc/init.d/${1}" enabled; }
 is_running()      { [ "$(ubus call service list "{ 'name': '$1' }" \
                         | jsonfilter -q -e "@['$1'].instances[*].running" \
                         | uniq)" = 'true' ]; }
+# dove 是 DaeNext core，没有 --version：改用 `dove identity` 的 version 字段
+# （形如 "daed rust-native product 3.1.0 dae-core=... target=..."），取其中纯版本号
+get_version()     { "$PROG" identity 2>/dev/null \
+                      | jsonfilter -e '@.version' 2>/dev/null \
+                      | awk '{for(i=1;i<=NF;i++) if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+$/) {print $i; exit}}'; }
 print_json_bool() { json_init; json_add_boolean "$1" "$2"; json_dump; json_cleanup; }
-print_error()     { json_init; json_add_boolean 'ok' '0'; json_add_string 'error' "$1"; json_dump; json_cleanup; }
 
-uci_get() {
-	local v
-	v="$(uci -q get "$NAME.settings.$1")"
-	[ -n "$v" ] && echo "$v"
-}
-
-config_file() { local v; v="$(uci_get config_file)"; echo "${v:-$DEFAULT_CONFIG_FILE}"; }
-log_file()    { local v; v="$(uci_get log_file)";    echo "${v:-$DEFAULT_LOG}"; }
-pid_file()    { local v; v="$(uci_get pid_file)";    echo "${v:-$DEFAULT_PID_FILE}"; }
-
-_get_dove_pid() {
-	local pid=""
-	[ -r "$(pid_file)" ] && pid="$(cat "$(pid_file)" 2>/dev/null)"
+# ── get_init_status ────────────────────────────────────────────────────────────
+# 通过 ps + /proc 取进程 PID（不依赖 ubus JSON 转义）
+_get_dae_pid() {
+	local pid
+	# 方法1: ps 匹配 dove run 命令行（procd 起的是 /usr/bin/dove run -c ...）
+	pid="$(ps 2>/dev/null | awk '$0~/[d]ove.*run/{print $1; exit}')"
+	# 方法2: pidof（OpenWrt busybox 支持）
 	[ -z "$pid" ] && pid="$(pidof dove 2>/dev/null | awk '{print $1}')"
 	echo "$pid"
 }
 
-# core 没有 --version，用 `dove identity` 的 version 字段
-get_version() {
-	[ -x "$PROG" ] || { echo ''; return 0; }
-	"$PROG" identity 2>/dev/null | jsonfilter -e '@.version' 2>/dev/null
-}
-
-# ── 状态 ──────────────────────────────────────────────────────────────────────
+# 接受可选 PID 参数，避免调用方重复执行 ps/pidof
 get_proc_uptime() {
-	local pid="${1:-$(_get_dove_pid)}"
+	local pid="${1:-$(_get_dae_pid)}"
 	[ -z "$pid" ] && { echo 0; return; }
 	local starttime sys_uptime
 	starttime="$(awk '{print $22}' /proc/"$pid"/stat 2>/dev/null)"
@@ -64,127 +41,77 @@ get_proc_uptime() {
 }
 
 get_proc_mem_mb() {
-	local pid="${1:-$(_get_dove_pid)}"
+	local pid="${1:-$(_get_dae_pid)}"
 	[ -z "$pid" ] && { echo 0; return; }
+	# VmRSS 单位 kB，转成 MB 保留一位小数
 	awk '/VmRSS/{printf "%.1f", $2/1024; exit}' /proc/"$pid"/status 2>/dev/null || echo 0
 }
 
 get_init_status() {
 	local name="${1:-$NAME}"
-	local version running=0 uptime=0 mem=0
-	version="$(get_version)"
+	local version; version="$(get_version)"
+	local running=0
 	is_running "$name" && running=1
+	local uptime=0 mem=0
 	if [ "$running" = "1" ]; then
-		local pid; pid="$(_get_dove_pid)"
+		# 优化: 只调用一次 _get_dae_pid，pid 结果复用给 uptime 和 mem
+		local pid; pid="$(_get_dae_pid)"
 		uptime="$(get_proc_uptime "$pid")"
 		mem="$(get_proc_mem_mb "$pid")"
 	fi
-
 	json_init
 	json_add_object "$name"
 	if is_enabled "$name"; then json_add_boolean 'enabled' '1'
 	else                        json_add_boolean 'enabled' '0'; fi
-	json_add_boolean 'running'  "$running"
-	json_add_string  'version'  "$version"
-	[ -n "$version" ] && json_add_boolean 'installed' '1' || json_add_boolean 'installed' '0'
-	json_add_int     'uptime'   "${uptime:-0}"
-	json_add_string  'mem'      "${mem:-0}"
-	json_add_string  'config'   "$(config_file)"
-	json_add_string  'log'      "$(log_file)"
-	json_add_string  'pid'      "$(_get_dove_pid)"
+	json_add_boolean 'running' "$running"
+	json_add_string  'version' "$version"
+	json_add_int     'uptime'  "${uptime:-0}"
+	json_add_string  'mem'     "${mem:-0}"
 	json_close_object
 	json_dump; json_cleanup
 }
 
+# ── get_mem ────────────────────────────────────────────────────────────────────
+# Bug fix: 前端已通过 getInitStatus 掌握 running 状态，此处无需重复调用 is_running()
+# (is_running 内部走 ubus call + jsonfilter，每秒触发代价较重)
+# 直接用 PID 判断进程是否存活，省去 ubus 调用
 get_mem() {
-	local pid="$( _get_dove_pid )" mem
-	[ -n "$pid" ] && mem="$(get_proc_mem_mb "$pid")"
+	local pid mem
+	pid="$(_get_dae_pid)"
+	if [ -n "$pid" ]; then
+		mem="$(awk '/VmRSS/{printf "%.1f", $2/1024; exit}' /proc/"$pid"/status 2>/dev/null)"
+	fi
 	json_init
 	json_add_string 'mem' "${mem:-0}"
 	json_dump; json_cleanup
 }
 
-# 完整 identity JSON（诊断用）
-get_identity() {
-	[ -x "$PROG" ] || { print_error "$PROG not found"; return 0; }
-	local raw; raw="$("$PROG" identity 2>/dev/null)"
-	[ -n "$raw" ] || { print_error 'identity command failed'; return 0; }
-	json_init
-	json_add_boolean 'ok' '1'
-	json_add_string  'raw' "$raw"
-	json_add_string  'version' "$(jsonfilter -s "$raw" -e '@.version' 2>/dev/null)"
-	json_dump; json_cleanup
-}
 
-# 校验配置：不带参数校验现网配置；带 content 校验未保存的文本
-validate_config() {
-	local content="$1" target tmp ok=0 err=''
-	target="$(config_file)"
-	if [ -n "$content" ]; then
-		tmp="/tmp/dove-validate.$$.dae"
-		umask 077
-		printf '%s\n' "$content" > "$tmp" || { print_error 'cannot write temp file'; return 0; }
-		target="$tmp"
-	fi
-	if out="$("$PROG" validate -c "$target" 2>&1)"; then
-		ok=1
-	else
-		err="$out"
-		[ -n "$err" ] || err='validate failed'
-	fi
-	[ -n "$tmp" ] && rm -f "$tmp"
-
-	json_init
-	json_add_boolean 'ok' "$ok"
-	json_add_string  'error' "$err"
-	json_add_string  'target' "$target"
-	json_dump; json_cleanup
-}
-
-# ── 日志 ──────────────────────────────────────────────────────────────────────
-get_log() {
-	local source="$1" path lines=''
-	case "$source" in
-		syslog)
-			path="logread | grep -iE 'dove'"
-			lines="$(logread 2>/dev/null | grep -iE 'dove' | tail -n "$LOG_LINES")"
-			;;
-		*)
-			source="core"
-			path="$(log_file)"
-			[ -f "$path" ] && lines="$(tail -n "$LOG_LINES" "$path" 2>/dev/null)"
-			;;
-	esac
-	json_init
-	json_add_string 'source' "$source"
-	json_add_string 'path'   "$path"
-	json_add_string 'log'    "$lines"
-	json_dump; json_cleanup
-}
-
-clear_log() {
-	local file; file="$(log_file)"
-	if [ -f "$file" ]; then
-		if : > "$file" 2>/dev/null; then print_json_bool "result" '1'
-		else                            print_json_bool "result" '0'; fi
-	else
-		print_json_bool "result" '0'
-	fi
-}
-
-# ── 服务控制 ──────────────────────────────────────────────────────────────────
 set_init_action() {
+	# 安全加固: 使用常量 $NAME 而非用户传入的 $name 拼接命令，
+	# 防止 name 参数含 shell 元字符时通过 eval 执行任意命令
 	local action="$1" cmd
-	case "$action" in
-		enable)  cmd="/etc/init.d/${NAME} enable" ;;
-		disable) cmd="/etc/init.d/${NAME} disable" ;;
-		start)   cmd="/etc/init.d/${NAME} start" ;;
-		stop)    cmd="/etc/init.d/${NAME} stop" ;;
-		restart) cmd="/etc/init.d/${NAME} restart" ;;
-		reload)  cmd="/etc/init.d/${NAME} reload" ;;
-		hot_reload) cmd="/etc/init.d/${NAME} hot_reload" ;;
+	case $action in
+		enable)
+			# Bug fix: 同步 UCI enabled=1，否则 reload_service() 会在 UCI 触发时
+			# 因为看到 enabled=0 而把已运行的服务 stop 掉，造成"设了自启但没自启"的现象
+			cmd="/etc/init.d/${NAME} enable \
+			  && uci set ${NAME}.settings.enabled=1 \
+			  && uci commit ${NAME}" ;;
+		disable)
+			cmd="/etc/init.d/${NAME} disable \
+			  && uci set ${NAME}.settings.enabled=0 \
+			  && uci commit ${NAME}" ;;
+		start|stop|restart)
+			cmd="/etc/init.d/${NAME} ${action}" ;;
+		reload_config)
+			# Bug fix: reload_config 在 init 脚本里不存在，应改用 hot_reload
+			cmd="/etc/init.d/${NAME} hot_reload" ;;
 		enable_start)
-			cmd="/etc/init.d/${NAME} enable && /etc/init.d/${NAME} start" ;;
+			cmd="/etc/init.d/${NAME} enable \
+			  && uci set ${NAME}.settings.enabled=1 \
+			  && uci commit ${NAME} \
+			  && /etc/init.d/${NAME} start" ;;
 	esac
 	if [ -n "$cmd" ] && eval "$cmd" >/dev/null 2>&1; then
 		print_json_bool "result" '1'
@@ -193,7 +120,16 @@ set_init_action() {
 	fi
 }
 
-# ── RPC dispatcher ────────────────────────────────────────────────────────────
+# ── clear_log ──────────────────────────────────────────────────────────────────
+clear_log() {
+	if : > "$LOG" 2>/dev/null; then
+		print_json_bool "result" '1'
+	else
+		print_json_bool "result" '0'
+	fi
+}
+
+# ── RPC dispatcher ─────────────────────────────────────────────────────────────
 case "$1" in
 	list)
 		json_init
@@ -203,18 +139,11 @@ case "$1" in
 		json_add_object "getMem"
 			json_add_string 'name' "name"
 		json_close_object
-		json_add_object "getIdentity"; json_close_object
-		json_add_object "getLog"
-			json_add_string 'source' "source"
-		json_close_object
-		json_add_object "clearLog"; json_close_object
-		json_add_object "validateConfig"
-			json_add_string 'content' "content"
-		json_close_object
 		json_add_object "setInitAction"
 			json_add_string 'name'   "name"
 			json_add_string 'action' "action"
 		json_close_object
+		json_add_object "clearLog"; json_close_object
 		json_dump; json_cleanup
 		;;
 	call)
@@ -222,28 +151,16 @@ case "$1" in
 			getInitStatus)
 				read -r input; json_load "$input"
 				json_get_var name 'name'; json_cleanup
-				[ "$name" = "$NAME" ] || { print_json_bool "result" '0'; exit 0; }
 				get_init_status "$name" ;;
 			getMem)
 				read -r input; json_load "$input"
 				json_get_var name 'name'; json_cleanup
-				[ "$name" = "$NAME" ] || { print_json_bool "result" '0'; exit 0; }
 				get_mem "$name" ;;
-			getIdentity)
-				get_identity ;;
-			getLog)
-				read -r input; json_load "$input"
-				json_get_var source 'source'; json_cleanup
-				get_log "$source" ;;
-			clearLog)
-				clear_log ;;
-			validateConfig)
-				read -r input; json_load "$input"
-				json_get_var content 'content'; json_cleanup
-				validate_config "$content" ;;
 			setInitAction)
 				read -r input; json_load "$input"
 				json_get_var action 'action'; json_cleanup
 				set_init_action "$action" ;;
+			clearLog)
+				clear_log ;;
 		esac ;;
 esac

@@ -79,9 +79,12 @@ _ensure_geodata() {
 	[ -e "$dir/geoip.dat" ]   || ln -sf /usr/share/v2ray/geoip.dat   "$dir/geoip.dat"   2>/dev/null
 	[ -e "$dir/geosite.dat" ] || ln -sf /usr/share/v2ray/geosite.dat "$dir/geosite.dat" 2>/dev/null
 
-	[ -d /usr/share/dae ] || mkdir -p /usr/share/dae 2>/dev/null
-	[ -e /usr/share/dae/geoip.dat ]   || ln -sf ../v2ray/geoip.dat   /usr/share/dae/geoip.dat   2>/dev/null
-	[ -e /usr/share/dae/geosite.dat ] || ln -sf ../v2ray/geosite.dat /usr/share/dae/geosite.dat 2>/dev/null
+	# 兜底目录要用解析器真正会找的路径（实测搜索列表）：
+	#   /etc/dove, /etc/daed, /usr/local/share/daed, /usr/share/daed, /.local/share/daed
+	# 注意 /usr/share/dae 不在列表里（之前那版是我猜的，没用）
+	[ -d /usr/share/daed ] || mkdir -p /usr/share/daed 2>/dev/null
+	[ -e /usr/share/daed/geoip.dat ]   || ln -sf ../v2ray/geoip.dat   /usr/share/daed/geoip.dat   2>/dev/null
+	[ -e /usr/share/daed/geosite.dat ] || ln -sf ../v2ray/geosite.dat /usr/share/daed/geosite.dat 2>/dev/null
 }
 
 _check_config() {
@@ -166,7 +169,13 @@ hot_reload() {
 		return 0
 	fi
 
-	echo "[dove] Hot-reload unavailable, falling back to restart." >> "$log_file"
+	# 服务本来没在跑 → 什么都不做（之前会走到 stop;start，把停着的服务拉起来）
+	if ! /etc/init.d/dove running 2>/dev/null; then
+		echo "[dove] Hot-reload skipped: service is not running." >> "$log_file"
+		return 0
+	fi
+
+	echo "[dove] Hot-reload unavailable while running, falling back to restart." >> "$log_file"
 	stop
 	start
 }

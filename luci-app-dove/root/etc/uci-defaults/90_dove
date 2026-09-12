@@ -1,35 +1,32 @@
 #!/bin/sh
-# SPDX-License-Identifier: AGPL-3.0-only
-#
-# uci-defaults: luci-app-dove 首次安装初始化
-# dove 包已经装好 /etc/init.d/dove、/etc/config/dove、/etc/dove/config.dae
-# 和 /usr/bin/dove；这里只处理权限、目录、软链与自启。
+# uci-defaults: first-install initialisation for luci-app-dove.
+# The dove kernel package already owns /etc/init.d/dove, /etc/config/dove
+# and /usr/bin/dove; this script only wires up permissions and autostart.
 
-# rpcd helper 权限（个别构建里安装后可能不是 755）
-chmod 0755 /usr/libexec/rpcd/luci.dove 2>/dev/null || true
+# Fix rpcd helper permissions (package installer may not set +x on some builds)
+chmod +x /usr/libexec/rpcd/luci.dove
 
-# 配置目录与日志
+# Dove 配置目录与日志（配置里可能有节点密码，0600）
 mkdir -p /etc/dove /var/log
 chmod 0700 /etc/dove 2>/dev/null || true
-# 配置里可能有节点密码，收紧权限（init 每次启动也会再 chmod 一次）
 chmod 0600 /etc/dove/config.dae 2>/dev/null || true
 touch /var/log/dove.log 2>/dev/null || true
 
-# geodata：core 的 geodata 目录 = 配置文件所在目录（/etc/dove），
-# 同时给 /usr/share/dae 兜底（GeodataResolver 的固定搜索路径之一）。
-# /etc/dove 用绝对目标（相对路径会算错，见 dove/Makefile 注释）；
-# 悬空软链在 -e 判断下为假，所以这里能自动纠正旧版的错链。
+# geodata：core 的 geodata 目录 = 配置文件所在目录（/etc/dove）。
+# /etc/dove -> /usr/share/v2ray 必须用绝对目标：写成 ../v2ray/... 会解析成
+# /etc/v2ray/...（悬空软链）。-e 判断能自动纠正旧版错链。
 [ -e /etc/dove/geoip.dat ]   || ln -sf /usr/share/v2ray/geoip.dat   /etc/dove/geoip.dat   2>/dev/null || true
 [ -e /etc/dove/geosite.dat ] || ln -sf /usr/share/v2ray/geosite.dat /etc/dove/geosite.dat 2>/dev/null || true
-mkdir -p /usr/share/dae
-# /usr/share/dae 的 ../v2ray 是对的（同为 /usr/share 下）
-[ -e /usr/share/dae/geoip.dat ]   || ln -sf ../v2ray/geoip.dat   /usr/share/dae/geoip.dat   2>/dev/null || true
-[ -e /usr/share/dae/geosite.dat ] || ln -sf ../v2ray/geosite.dat /usr/share/dae/geosite.dat 2>/dev/null || true
+# 解析器真正会找的兜底目录（实测：/etc/dove, /etc/daed, /usr/local/share/daed,
+# /usr/share/daed, /.local/share/daed）—— /usr/share/dae 不在列表里
+mkdir -p /usr/share/daed
+[ -e /usr/share/daed/geoip.dat ]   || ln -sf ../v2ray/geoip.dat   /usr/share/daed/geoip.dat   2>/dev/null || true
+[ -e /usr/share/daed/geosite.dat ] || ln -sf ../v2ray/geosite.dat /usr/share/daed/geosite.dat 2>/dev/null || true
 
-# 让 rpcd 立刻加载新的 ACL / helper
+# Restart rpcd so the new ACL / helper are picked up immediately
 /etc/init.d/rpcd restart
 
-# 自启（不在安装时启动服务；由用户从 LuCI 点启动，或重启后随 rc.d 启动）
-/etc/init.d/dove enable 2>/dev/null || true
+# Enable the dove service (do not auto-start; user enables via LuCI)
+/etc/init.d/dove enable
 
 return 0

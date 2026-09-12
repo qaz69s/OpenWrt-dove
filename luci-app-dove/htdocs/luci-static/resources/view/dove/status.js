@@ -1,132 +1,330 @@
-/* SPDX-License-Identifier: AGPL-3.0-only */
 'use strict';
-'require view';
 'require rpc';
-'require ui';
-
-/*
- * Dove 运行态：core 进程状态 + `dove identity` + 配置校验。
- * 刷新用自管 setInterval（节点移除后自清）；LuCI 的 poll 在部分版本上会静默失效。
- */
+'require poll';
+'require baseclass';
 
 var NAME = 'dove';
-var REFRESH_MS = 5000;
 
-var callGetInitStatus = rpc.declare({ object: 'luci.dove', method: 'getInitStatus', params: [ 'name' ], expect: {} });
-var callGetIdentity   = rpc.declare({ object: 'luci.dove', method: 'getIdentity', expect: {} });
-var callValidate      = rpc.declare({ object: 'luci.dove', method: 'validateConfig', params: [ 'content' ], expect: {} });
+/* ── 操作按钮 SVG ── */
+var SVG_PLAY    = '<svg viewBox="0 0 16 16" width="13" height="13" fill="currentColor" style="vertical-align:middle"><path d="M3 2.5l10 5.5-10 5.5V2.5z"/></svg>';
+var SVG_RESTART = '<svg viewBox="0 0 16 16" width="13" height="13" fill="currentColor" style="vertical-align:middle"><path d="M8 3a5 5 0 1 0 4.546 2.914.5.5 0 0 1 .908-.417A6 6 0 1 1 8 2v1z"/><path d="M8 4.466V.534a.25.25 0 0 1 .41-.192l2.36 1.966c.12.1.12.284 0 .384L8.41 4.658A.25.25 0 0 1 8 4.466z"/></svg>';
+var SVG_STOP    = '<svg viewBox="0 0 16 16" width="11" height="11" fill="currentColor" style="vertical-align:middle"><rect x="2.5" y="2.5" width="11" height="11" rx="1"/></svg>';
+var SVG_SPINNER = '<svg class="jy-spin" viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.5" style="vertical-align:middle"><circle cx="8" cy="8" r="5.5" stroke-opacity=".18"/><path d="M8 2.5A5.5 5.5 0 0 1 13.5 8"/></svg>';
 
-function fmtUptime(sec) {
-	sec = parseInt(sec || 0, 10);
-	if (!sec) return '—';
-	var d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600), m = Math.floor((sec % 3600) / 60);
-	if (d) return d + _('天') + ' ' + h + _('小时');
-	if (h) return h + _('小时') + ' ' + m + _('分');
-	if (m) return m + _('分') + ' ' + (sec % 60) + _('秒');
-	return sec + _('秒');
-}
+/* ── RPC ── */
+var getInitStatus = rpc.declare({ object: 'luci.' + NAME, method: 'getInitStatus', params: ['name'] });
+var getMem        = rpc.declare({ object: 'luci.' + NAME, method: 'getMem',        params: ['name'], expect: { mem: '' } });
+var setInitAction = rpc.declare({ object: 'luci.' + NAME, method: 'setInitAction', params: ['name', 'action'], expect: { result: false } });
 
-return view.extend({
-	load: function () {
-		return Promise.all([
-			L.resolveDefault(callGetInitStatus(NAME), {}),
-			L.resolveDefault(callGetIdentity(), {})
+return baseclass.extend({
+	render: function () {
+
+		/* ── 状态徽章 ── */
+		var dot = E('span', { style: [
+			'display:inline-block;width:7px;height:7px;border-radius:50%;',
+			'background:#aaa;flex-shrink:0;transition:background .25s;',
+		].join('') });
+		var statusText  = E('span', { style: 'font-weight:600;font-size:12px;' }, [_('检测中…')]);
+		var statusBadge = E('span', { style: [
+			'display:inline-flex;align-items:center;gap:6px;',
+			'padding:3px 10px;border-radius:20px;',
+			'background:rgba(128,128,128,.12);transition:background .25s;',
+		].join('') }, [dot, statusText]);
+
+		/* ── 标题区（徽章紧跟 Dove 右侧） ── */
+		var titleRow = E('div', { style: 'display:flex;align-items:center;gap:10px;margin-bottom:3px;' }, [
+			E('span', { style: 'font-size:20px;font-weight:700;color:var(--jy-title);' }, ['Dove']),
+			statusBadge,
 		]);
-	},
+		var subtitle = E('div', { style: 'font-size:12px;font-weight:500;color:var(--jy-muted);margin-bottom:20px;' }, [
+			_('基于 eBPF 的 Linux 高性能透明代理解决方案。'),
+		]);
 
-	render: function (data) {
-		var st = (data[0] && data[0][NAME]) || {};
-		var id = data[1] || {};
+		/* ── 指标格子 ── */
+		var versionEl = E('div', { style: 'font-size:11px;font-weight:600;line-height:1.6;color:var(--jy-text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;width:100%;display:block;' }, ['—']);
+		var memEl     = E('div', { style: 'font-size:13px;font-weight:700;color:#5cb85c;overflow-wrap:break-word;' }, ['—']);
+		var uptimeEl  = E('div', { style: 'font-size:13px;font-weight:700;color:#5cb85c;overflow-wrap:break-word;' }, ['—']);
 
-		function metric(label, valueEl) {
-			return E('div', { style: 'display:flex;justify-content:space-between;gap:10px;padding:6px 0;border-bottom:1px solid var(--border-color-medium, #ddd);' }, [
-				E('span', { style: 'color:var(--secondary-color-high, #888);font-size:13px;' }, [ label ]),
-				valueEl
+		var SVG_MEM_ICON    = '<svg viewBox="0 0 16 16" width="12" height="12" style="vertical-align:middle;margin-right:4px;display:inline-block;background:transparent !important"><rect x="2" y="3" width="12" height="10" rx="0.8" fill="none" stroke="currentColor" stroke-width="1"/><rect x="3" y="4" width="2.2" height="8" fill="currentColor"/><rect x="5.6" y="4.5" width="2.2" height="7.5" fill="currentColor" opacity=".8"/><rect x="8.2" y="5" width="2.2" height="7" fill="currentColor" opacity=".6"/></svg>';
+		var SVG_UPTIME_ICON = '<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" style="vertical-align:middle;margin-right:4px;display:inline-block;background:transparent !important"><circle cx="8" cy="8" r="5"/><path d="M8 5v3l2 1.5" stroke-linejoin="round"/><circle cx="8" cy="3" r="0.5" fill="currentColor"/></svg>';
+		var SVG_KERNEL_ICON = '<svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor" style="vertical-align:middle;margin-right:4px;display:inline-block;background:transparent !important"><circle cx="8" cy="8" r="2.2"/><circle cx="8" cy="3" r="0.9"/><circle cx="12.5" cy="8" r="0.9"/><circle cx="8" cy="13" r="0.9"/><circle cx="3.5" cy="8" r="0.9"/><line x1="8.8" y1="5" x2="11.5" y2="6.8" stroke="currentColor" stroke-width="0.8" stroke-linecap="round"/><line x1="11.5" y1="9" x2="8.8" y2="11" stroke="currentColor" stroke-width="0.8" stroke-linecap="round"/><line x1="5" y1="11" x2="5" y2="9" stroke="currentColor" stroke-width="0.8" stroke-linecap="round"/><line x1="5" y1="5" x2="5" y2="7" stroke="currentColor" stroke-width="0.8" stroke-linecap="round"/></svg>';
+
+		function mkMetric(label, valueEl, icon) {
+			var labelWrap = E('div', { style: 'font-size:11px;font-weight:600;letter-spacing:.03em;color:var(--jy-muted);margin-bottom:6px;display:flex;align-items:center;' });
+			if (icon) labelWrap.innerHTML = icon;
+			labelWrap.appendChild(document.createTextNode(label));
+			return E('div', { style: 'background:var(--jy-bg2);border:1px solid var(--jy-border);border-radius:5px;padding:12px 14px;min-width:0;' }, [
+				labelWrap,
+				valueEl,
 			]);
 		}
-		function val(text, mono) {
-			return E('span', { style: 'font-weight:600;font-size:13px;' + (mono ? 'font-family:monospace;' : ''), title: text }, [ text ]);
+		var metrics = E('div', { class: 'jy-metrics', style: 'display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:14px;' }, [
+			mkMetric(_('内存占用'), memEl, SVG_MEM_ICON),
+			mkMetric(_('运行时间'), uptimeEl, SVG_UPTIME_ICON),
+			mkMetric(_('内核版本'), versionEl, SVG_KERNEL_ICON),
+		]);
+
+		/* ── 分割线 ── */
+		var divider = E('hr', { style: 'border:none;border-top:1px solid var(--jy-border);margin:0 0 16px;' });
+
+		/* ── 服务区块（开机自启滑动开关） ── */
+		var toggleThumb = E('span', { style: [
+			'position:absolute;top:2px;left:2px;',
+			'width:16px;height:16px;border-radius:50%;',
+			'background:#fff;',
+			'transition:left .18s cubic-bezier(.4,0,.2,1);',
+			'box-shadow:0 1px 3px rgba(0,0,0,.28);',
+		].join('') });
+
+		var toggleTrack = E('span', { style: [
+			'position:relative;display:inline-block;flex-shrink:0;',
+			'width:36px;height:20px;border-radius:10px;',
+			'background:rgba(128,128,128,.25);',
+			'transition:background .18s;cursor:pointer;',
+		].join('') }, [toggleThumb]);
+
+		var _toggleOn = false;
+		function setToggle(checked) {
+			_toggleOn = checked;
+			toggleTrack.style.background = checked ? '#27ae60' : 'rgba(128,128,128,.25)';
+			toggleThumb.style.left       = checked ? '18px' : '2px';
 		}
 
-		var runEl  = E('span', { style: 'font-weight:600;' }, [ st.running ? _('运行中') : _('已停止') ]);
-		var verEl  = E('span', { style: 'font-weight:600;font-size:12px;word-break:break-all;' }, [ st.version || _('未安装') ]);
-		var memEl  = E('span', { style: 'font-weight:600;font-size:13px;' }, [ (st.mem || '0') + ' MB' ]);
-		var upEl   = E('span', { style: 'font-weight:600;font-size:13px;' }, [ fmtUptime(st.uptime) ]);
-		var pidEl  = E('span', { style: 'font-weight:600;font-size:13px;font-family:monospace;' }, [ st.pid || '—' ]);
-		var cfgEl  = E('span', { style: 'font-weight:600;font-size:12px;font-family:monospace;' }, [ st.config || '—' ]);
-		var logEl  = E('span', { style: 'font-weight:600;font-size:12px;font-family:monospace;' }, [ st.log || '—' ]);
-		var noteEl = E('span', { style: 'font-size:12px;color:#c33;' }, [ st.running ? '' : _('服务未运行：到「配置」页点启动，或 /etc/init.d/dove start') ]);
+		toggleTrack.addEventListener('click', function () {
+			var next = !_toggleOn;
+			setToggle(next);
+			setInitAction(NAME, next ? 'enable' : 'disable');
+		});
 
-		function apply(s, i) {
-			runEl.textContent = s.running ? _('运行中') : _('已停止');
-			verEl.textContent = s.version || _('未安装');
-			memEl.textContent = (s.mem || '0') + ' MB';
-			upEl.textContent  = fmtUptime(s.uptime);
-			pidEl.textContent = s.pid || '—';
-			cfgEl.textContent = s.config || '—';
-			logEl.textContent = s.log || '—';
-			noteEl.textContent = s.running ? '' : _('服务未运行：到「配置」页点启动，或 /etc/init.d/dove start');
+		var serviceSection = E('div', { style: 'margin-bottom:16px;' }, [
+			E('div', { style: 'font-size:11px;font-weight:600;letter-spacing:.04em;color:var(--jy-muted);margin-bottom:8px;' }, [_('服务')]),
+			E('div', { style: 'display:flex;align-items:center;gap:8px;' }, [
+				toggleTrack,
+				E('span', { style: 'font-size:13px;cursor:pointer;user-select:none;' }, [_('开机自启')]),
+			]),
+		]);
+
+		/* ── 状态控制：启动 / 重启 / 停止 ── */
+		var BTN_DEFS = [
+			{ key: 'start',   svg: SVG_PLAY,    label: _('启动'), color: '#27ae60', hover: 'rgba(39,174,96,.10)'  },
+			{ key: 'restart', svg: SVG_RESTART,  label: _('重启'), color: '#2980b9', hover: 'rgba(41,128,185,.10)' },
+			{ key: 'stop',    svg: SVG_STOP,     label: _('停止'), color: '#c0392b', hover: 'rgba(192,57,43,.10)'  },
+		];
+		var buttons = {};
+		var btnRow  = E('div', { style: 'display:flex;gap:8px;flex-wrap:wrap;' });
+
+		BTN_DEFS.forEach(function (def) {
+			var btn = E('button', {
+				style: [
+					'display:inline-flex;align-items:center;gap:6px;',
+					'padding:7px 16px;border:1px solid ' + def.color + ';border-radius:5px;',
+					'font-size:13px;font-family:inherit;font-weight:500;',
+					'cursor:pointer;color:' + def.color + ';background:transparent;',
+					'transition:background .15s,transform .1s,opacity .15s;opacity:.45;',
+				].join(''),
+				disabled: true,
+			});
+			btn._svg   = def.svg;
+			btn._label = def.label;
+			btn._color = def.color;
+			btn._hover = def.hover;
+			btn.innerHTML = def.svg + ' ' + def.label;
+			btn.addEventListener('mouseenter', function () { if (!btn.disabled) btn.style.background = def.hover; });
+			btn.addEventListener('mouseleave', function () { btn.style.background = 'transparent'; });
+			btn.addEventListener('mousedown',  function () { if (!btn.disabled) btn.style.transform = 'scale(.97)'; });
+			btn.addEventListener('mouseup',    function () { btn.style.transform = ''; });
+			buttons[def.key] = btn;
+			btnRow.appendChild(btn);
+		});
+
+		var ctrlSection = E('div', {}, [
+			E('div', { style: 'font-size:11px;font-weight:600;letter-spacing:.04em;color:var(--jy-muted);margin-bottom:8px;' }, [_('状态控制')]),
+			btnRow,
+		]);
+
+		var card = E('div', {}, [titleRow, subtitle, metrics, divider, serviceSection, ctrlSection]);
+
+		/* ── Uptime ── */
+		var uptimeTimer = null, uptimeAnchor = 0;
+		function pad(n) { return n < 10 ? '0' + n : '' + n; }
+		function fmtUptime() {
+			var s   = Math.max(0, Math.floor((Date.now() - uptimeAnchor) / 1000));
+			var y   = Math.floor(s / 31536000);
+			var d   = Math.floor((s % 31536000) / 86400);
+			var h   = Math.floor((s % 86400) / 3600);
+			var m   = Math.floor((s % 3600) / 60);
+			var sec = s % 60;
+			var out = '';
+			if (y) out += y + _('年') + ' ';
+			if (d || y) out += d + _('天') + ' ';
+			return out + pad(h) + ':' + pad(m) + ':' + pad(sec);
 		}
-		apply(st, id);
+		function startUptime(secs) {
+			uptimeAnchor = Date.now() - (secs > 0 ? secs * 1000 : 0);
+			uptimeEl.textContent = fmtUptime();
+			if (uptimeTimer === null) uptimeTimer = setInterval(function () {
+				if (!document.body.contains(card)) { clearInterval(uptimeTimer); uptimeTimer = null; return; }
+				uptimeEl.textContent = fmtUptime();
+			}, 1000);
+		}
+		function stopUptime() {
+			clearInterval(uptimeTimer); uptimeTimer = null; uptimeEl.textContent = '—';
+		}
 
-		var idPre = E('pre', {
-			style: 'margin:6px 0 0;padding:8px;max-height:16em;overflow:auto;font-size:11px;white-space:pre-wrap;' +
-				'background:var(--background-color-low, #f5f5f5);border-radius:4px;'
-		}, [ id.raw || _('（identity 不可用）') ]);
+		/* ── 状态管理 ── */
+		var lastRunning     = null;
+		var actionInFlight  = false;
+		var fastPollTimer   = null;
+		var statusPending   = false;
+		var lastActionTime  = 0;
+		var ACTION_COOLDOWN = 1500;
 
-		var checkEl = E('span', { style: 'font-size:12px;color:var(--secondary-color-high, #888);margin-left:8px;' }, [ '' ]);
-		var checkBtn = E('button', {
-			class: 'cbi-button', style: 'padding:5px 12px;',
-			click: function () {
-				checkEl.textContent = _('校验中…');
-				return callValidate('').then(function (r) {
-					if (r && r.ok) { checkEl.textContent = _('配置校验通过'); ui.addNotification(null, E('p', {}, [ _('配置校验通过') ]), 'info'); }
-					else { checkEl.textContent = _('校验失败'); ui.addNotification(null, E('p', {}, [ _('校验失败: ') + ((r && r.error) || '') ]), 'error'); }
-				}).catch(function () { checkEl.textContent = _('校验异常'); });
-			}
-		}, [ _('校验当前配置') ]);
-
-		function refresh() {
-			return Promise.all([
-				L.resolveDefault(callGetInitStatus(NAME), {}),
-				L.resolveDefault(callGetIdentity(), {})
-			]).then(function (d) {
-				var s = (d[0] && d[0][NAME]) || {};
-				var i = d[1] || {};
-				apply(s, i);
-				idPre.textContent = i.raw || _('（identity 不可用）');
+		function applyButtonStates(running, installed) {
+			if (actionInFlight) return;
+			var dis = { start: running, restart: !running, stop: !running };
+			Object.keys(buttons).forEach(function (k) {
+				var b   = buttons[k];
+				var off = !installed || dis[k];
+				b.disabled         = off;
+				b.style.opacity    = off ? '.45' : '1';
+				b.style.cursor     = off ? 'not-allowed' : 'pointer';
+				b.style.background = 'transparent';
+				b.innerHTML = b._svg + ' ' + b._label;
+			});
+		}
+		function lockAllButtons() {
+			Object.keys(buttons).forEach(function (k) {
+				var b = buttons[k];
+				b.disabled = true; b.style.opacity = '.45'; b.style.cursor = 'not-allowed';
 			});
 		}
 
-		var card = E('div', { class: 'cbi-section', style: 'padding:10px 12px;max-width:760px;' }, [
-			metric(_('服务状态'), runEl),
-			metric(_('版本'), verEl),
-			metric(_('内存 (RSS)'), memEl),
-			metric(_('运行时长'), upEl),
-			metric(_('进程 PID'), pidEl),
-			metric(_('配置文件'), cfgEl),
-			metric(_('日志文件'), logEl),
-			E('div', { style: 'margin-top:10px;' }, [ checkBtn, checkEl ]),
-			E('div', { style: 'margin-top:8px;' }, [ noteEl ]),
-			E('details', { style: 'margin-top:10px;' }, [
-				E('summary', { style: 'cursor:pointer;font-size:12px;color:var(--secondary-color-high, #888);' }, [ _('dove identity 原始输出') ]),
-				idPre
-			])
-		]);
+		var BADGE = {
+			running: { dot: '#62c462', bg: 'rgba(39,174,96,.16)',  text: _('运行中'),  color: '#62c462', anim: 'jy-blink 2s ease-in-out infinite' },
+			stopped: { dot: '#e05c58', bg: 'rgba(192,57,43,.16)',  text: _('未运行'),  color: '#e87370', anim: 'none' },
+			working: { dot: '#f0ad4e', bg: 'rgba(243,156,18,.14)', text: _('操作中…'), color: '#f0ad4e', anim: 'none' },
+		};
+		function setBadge(state) {
+			var c = BADGE[state] || BADGE.stopped;
+			dot.style.background         = c.dot;
+			dot.style.animation          = c.anim;
+			statusBadge.style.background = c.bg;
+			statusText.textContent       = c.text;
+			statusText.style.color       = c.color;
+		}
 
-		var timer = setInterval(function () {
-			if (!document.body.contains(card)) { clearInterval(timer); return; }
-			refresh();
-		}, REFRESH_MS);
+		function applyStatus(data) {
+			var st        = (data && data[NAME]) || {};
+			var running   = !!st.running;
+			var installed = !!st.version;
 
-		return E('div', {}, [
-			E('h2', {}, [ _('Dove 运行态') ]),
-			E('div', { class: 'cbi-map-descr' }, [ _('每 %s 秒自动刷新。').format(REFRESH_MS / 1000) ]),
-			card
-		]);
+			var vText = st.version || _('未安装');
+			versionEl.textContent = vText;
+			versionEl.title = vText;
+
+			/* 同步开机自启滑动开关 */
+			setToggle(!!st.enabled);
+
+			setBadge(running ? 'running' : 'stopped');
+			if (running) {
+				startUptime(typeof st.uptime === 'number' ? st.uptime : 0);
+				if (st.mem && String(st.mem) !== '0') memEl.textContent = st.mem + ' MB';
+			} else {
+				if (lastRunning !== false) { stopUptime(); memEl.textContent = '—'; }
+			}
+			lastRunning = running;
+			applyButtonStates(running, installed);
+		}
+
+		function stopFastPoll() {
+			if (fastPollTimer) { clearInterval(fastPollTimer); fastPollTimer = null; }
+		}
+		function waitForState(expectedRunning, timeoutMs) {
+			stopFastPoll();
+			var deadline = Date.now() + (timeoutMs || 10000);
+			fastPollTimer = setInterval(function () {
+				if (!document.body.contains(card)) { stopFastPoll(); return; }
+				if (Date.now() > deadline) {
+					stopFastPoll(); actionInFlight = false; lastActionTime = Date.now();
+					L.resolveDefault(getInitStatus(NAME), {}).then(applyStatus);
+					return;
+				}
+				L.resolveDefault(getInitStatus(NAME), {}).then(function (data) {
+					var st = (data && data[NAME]) || {};
+					if (!!st.running === expectedRunning) {
+						stopFastPoll(); actionInFlight = false; lastActionTime = Date.now();
+						applyStatus(data);
+					}
+				});
+			}, 400);
+		}
+
+		function bindAction(key, action) {
+			buttons[key].addEventListener('click', function () {
+				if (actionInFlight) return;
+				if (Date.now() - lastActionTime < ACTION_COOLDOWN) return;
+				actionInFlight = true;
+				stopFastPoll();
+				lockAllButtons();
+				buttons[key].innerHTML = SVG_SPINNER + ' ' + buttons[key]._label + '…';
+				setBadge('working');
+				setInitAction(NAME, action)
+					.then(function (ok) {
+						if (!ok) console.warn('[dove] action "' + action + '" returned false');
+						if (action === 'restart') {
+							var phase2done = false;
+							fastPollTimer = setInterval(function () {
+								if (phase2done) return;
+								L.resolveDefault(getInitStatus(NAME), {}).then(function (data) {
+									var st = (data && data[NAME]) || {};
+									if (!st.running || phase2done) {
+										stopFastPoll();
+										if (!phase2done) { phase2done = true; waitForState(true, 10000); }
+									}
+								});
+							}, 400);
+							setTimeout(function () {
+								if (!phase2done) { phase2done = true; stopFastPoll(); waitForState(true, 10000); }
+							}, 5000);
+						} else {
+							waitForState(action === 'start', 8000);
+						}
+					})
+					.catch(function (err) {
+						console.error('[dove] RPC error:', err);
+						actionInFlight = false; lastActionTime = Date.now();
+						L.resolveDefault(getInitStatus(NAME), {}).then(applyStatus);
+					});
+			});
+		}
+		bindAction('start',   'start');
+		bindAction('restart', 'restart');
+		bindAction('stop',    'stop');
+
+		function refresh() {
+			if (statusPending || actionInFlight) return;
+			statusPending = true;
+			return L.resolveDefault(getInitStatus(NAME), {}).then(function (data) {
+				statusPending = false; applyStatus(data);
+			}, function () { statusPending = false; });
+		}
+		refresh();
+		var pollFn = function () {
+			if (!document.body.contains(card)) { poll.remove(pollFn); return; }
+			return refresh();
+		};
+		poll.add(pollFn, 5);
+
+		var memTimer = setInterval(function () {
+			if (!document.body.contains(card)) { clearInterval(memTimer); return; }
+			if (actionInFlight || lastRunning !== true) return;
+			L.resolveDefault(getMem(NAME), '').then(function (mem) {
+				if (!actionInFlight && lastRunning === true)
+					memEl.textContent = (mem && String(mem) !== '0') ? mem + ' MB' : '—';
+			});
+		}, 1000);
+
+		poll.start();
+		return card;
 	},
-
-	handleSaveApply: null,
-	handleSave: null,
-	handleReset: null
 });

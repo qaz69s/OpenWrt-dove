@@ -14,7 +14,12 @@ global {
 	log_level: "info"
 	# 内核参数/防火墙自动配置（eBPF 透明代理通常要保持开着）
 	auto_config_kernel_parameter: true
+	# WAN 可以用 auto
 	wan_interface: "auto"
+	# ⚠️ LAN 必须写真实存在的接口，**不能用 auto**（core 预检会直接拒绝：
+	#    "global.lan_interface must specify at least one existing LAN interface"）。
+	#    没有它服务会 crash loop。OpenWrt 一般是 br-lan；多网段可写 "br-lan,br-guest"。
+	lan_interface: "br-lan"
 }
 
 routing {

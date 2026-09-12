@@ -124,13 +124,24 @@ DOVE_CORE_SRC=$HOME/DaeNext DOVE_RUST_TARGET=x86_64-unknown-linux-musl DOVE_JOBS
 
 支持的架构：`x86_64`、`aarch64`（含 `aarch64_cortex-a53` 这类复合名）。
 
-## LuCI 三页
+## LuCI 界面：joey 原样移植
 
-- **配置**：直接编辑 `/etc/dove/config.dae`（fs 读写 + ACL）。保存 → `hot_reload`
-  （SIGUSR1，不断连接）；「仅校验」校验编辑器里未保存的文本；Ctrl+S 保存。
-- **状态**：进程状态 / `dove identity` 版本 / RSS / 运行时长 / pid / 配置与日志路径 /
-  「校验当前配置」；5 秒自刷新（自管定时器，页面移除即清）。
-- **日志**：`/var/log/dove.log`（或 logread），关键字过滤、自动刷新、清空。
+界面代码是 **joey 那套原样搬过来的**（`overview.js` 单页 + `status.js`/`log.js` 两个标签页，
+`require('view.dove.status')` 方式挂载），只换了引擎相关的几处：
+
+| joey（原版 dae） | dove（DaeNext core） |
+|---|---|
+| `PROG=/usr/bin/dae` | `PROG=/usr/bin/dove` |
+| `dae --version \| awk 'NR==1{print $3}'` | `dove identity` 里取版本号字段 |
+| `ps \| awk '/[d]ae.*run/'` | `ps \| awk '/[d]ove.*run/'` |
+| `/etc/joey/config.dae` | `/etc/dove/config.dae` |
+| `/var/log/joey.log` | `/var/log/dove.log` |
+| `luci.joey` / `admin/services/joey` | `luci.dove` / `admin/services/dove` |
+
+菜单只有一项（`admin/services/dove` → `dove/overview`），页面内三个标签 —— 与 joey 一致。
+rpcd 方法保持 joey 的四个：`getInitStatus` / `getMem` / `setInitAction` / `clearLog`
+（`setInitAction` 的 action 名也照抄：`start|stop|restart|enable|disable|reload_config|enable_start`，
+其中 `reload_config` → `/etc/init.d/dove hot_reload`）。
 
 ## 与 deer / joey 共存
 

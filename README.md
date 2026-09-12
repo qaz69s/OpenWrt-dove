@@ -149,6 +149,42 @@ rpcd 方法保持 joey 的四个：`getInitStatus` / `getMem` / `setInitAction` 
 - 不占端口（core 没有 API/面板）。**和 joey 一样，一台机上只能有一个 eBPF 透明代理
   在跑** —— joey/dove/deer 同时开数据面会互相踩，别同时启用。
 
+## 代理明细日志（需要上游补丁分支）
+
+DaeNext 的 resident 事件模块是 **dispatch-only**：`crates/dae-resident-core/src/events.rs`
+注释原文「File-based persistence was removed: resident events are dispatch-only to
+the configured sink」；绑定 sink 的代码在**产品层**
+（`daed_product/logs/init.rs::register_resident_event_product_log_sink`），被
+`product-api` 门控。所以：
+
+- **daed / deer**：有代理日志
+- **core / dove（未打补丁）**：事件直接丢弃，日志里只有 `service ready` / `service stopping`
+
+修法（已实现，在 fork 的分支上）：
+**`qaz69s/DaeNext` 分支 `dove/core-event-log`**（commit `7c2cc6ef`，改动
+`crates/dae-daemon/src/service_contract/resident_service.rs` +83 行）：
+`run_resident_service()` 里读配置后调用 `install_core_event_log_sink()`，
+用公开 API `dae_resident_dataplane::facade::{set_event_log_sink,set_event_log_policies}`
+把事件按 JSONL 追加到 `--logfile`。级别跟随 `global.log_level`：
+
+- `*_route_chosen` / `*_path_chosen` / `session_started|stopped` / `*_failed` → `info`
+- 其余 packet 级 → `debug`（避免 UDP 事件刷爆日志）
+
+拿到带日志的二进制：把 DaeNext 源码切到该分支，然后用 `DOVE_SOURCE_MODE=source`
+编译（或用它编出来的二进制走 `DOVE_SOURCE_MODE=local` / 发 release 资产走 `prebuilt`）。
+
+日志长相（LuCI 日志页直接可见，可按关键字过滤）：
+
+```
+service ready
+{"event":"resident_health_checker_started","group":"proxy","group_policy":"min_moving_avg","candidate_count":1,...}
+{"event":"tcp_worker_started","dial_mode":"domain",...}
+{"event":"tcp_route_chosen","dial_target":"www.google.com:443","dialer":"USA1","final_outbound":2,...}
+```
+
+事件类型全集见 `crates/dae-resident-core/src/events/model.rs`（17 种，含
+`tcp_route_chosen` / `udp_route_chosen` / `dns_path_chosen` / `udp_session_*` / `*_failed`）。
+
 ## 容易踩的坑
 
 - 配置里 `routing` 必须保留本机网段直连（`dip(192.168.0.0/16) -> must_direct` 等），

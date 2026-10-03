@@ -159,7 +159,6 @@ define Package/dove/postinst
 [ -z "$${IPKG_INSTROOT}" ] && {
 	mkdir -p /etc/dove /var/log
 	chmod 0600 /etc/dove/config.dae 2>/dev/null || true
-	[ -x /etc/init.d/dove ] && /etc/init.d/dove enable 2>/dev/null || true
 	if /etc/init.d/dove running 2>/dev/null; then
 		/etc/init.d/dove restart 2>/dev/null || true
 	fi

@@ -1,7 +1,7 @@
 #!/bin/sh
 # uci-defaults: first-install initialisation for luci-app-dove.
 # The dove kernel package already owns /etc/init.d/dove, /etc/config/dove
-# and /usr/bin/dove; this script only wires up permissions and autostart.
+# and /usr/bin/dove; this script only wires up permissions.
 
 # Fix rpcd helper permissions (package installer may not set +x on some builds)
 chmod +x /usr/libexec/rpcd/luci.dove
@@ -26,7 +26,9 @@ mkdir -p /usr/share/daed
 # Restart rpcd so the new ACL / helper are picked up immediately
 /etc/init.d/rpcd restart
 
-# Enable the dove service (do not auto-start; user enables via LuCI)
-/etc/init.d/dove enable
+# 出厂默认：不预设开机自启（不创建 /etc/rc.d/S99dove）、不启动服务。
+# 「开机自启」与「启动」都由用户在 LuCI 里自行操作。
+# 这里刻意不调用 enable/disable：升级/重装时会重跑本脚本（default_postinst
+# 里没有升级判断），一旦调用就会覆盖用户已经做出的选择。
 
 return 0
